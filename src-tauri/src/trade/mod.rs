@@ -14,6 +14,7 @@
 //! Tauri state and drives [`Pricing::price`].
 
 mod gear;
+mod i18n;
 mod ninja;
 mod parse;
 mod stats;
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::async_runtime::Mutex as AsyncMutex;
 
+pub use i18n::is_russian;
 pub use ninja::SheetEntry;
 pub use parse::parse_item;
 
@@ -90,6 +92,16 @@ pub struct Listing {
     pub exalt_val: f64,
     /// Relative age of the listing, e.g. `"3h"`, or `"poe.ninja avg"` for bulk.
     pub age: String,
+    /// Asking amount as shown (`"12"`, `"1.5"`) and its trade2 currency id
+    /// (`"chaos"`, `"divine"`, …) — the overlay renders `12× <icon>` like the game.
+    pub amount: String,
+    pub currency: String,
+    /// Exalt equivalent for non-exalt/divine prices (`"142.27"`), else `None`.
+    pub equiv: Option<String>,
+    /// Currency icon URLs (trade2 `data/static`), filled in by [`Pricing`]; `None` →
+    /// the overlay falls back to the text `display`.
+    pub icon: Option<String>,
+    pub equiv_icon: Option<String>,
 }
 
 /// A parsed stat line resolved to a trade2 stat id, with the value used to seed the
@@ -133,6 +145,16 @@ pub struct PriceResult {
     /// Total matches the trade2 search reported — the listings above are only the
     /// cheapest few, so this is what turns "ten rows of 1 E" into a readable spread.
     pub total: Option<u64>,
+    /// How the automatic search was loosened after the exact one came back empty
+    /// (e.g. "any 3 of 4 mods"); `None` = the shown filters matched as-is.
+    pub relaxed: Option<String>,
+    /// The search on the trade site (`…/trade2/search/poe2/<league>/<id>`), for the
+    /// "Open on trade" button; `None` for poe.ninja / failed searches.
+    pub trade_url: Option<String>,
+    /// The `query` object behind `trade_url`, kept so a Russian-client link can be
+    /// rebuilt with Russian names (the ru. site rejects English base types).
+    #[serde(skip)]
+    pub site_query: Option<serde_json::Value>,
     pub parsed_stats: Vec<ParsedStat>,
     pub base_properties: Vec<BaseProp>,
     pub league: String,
@@ -164,6 +186,9 @@ impl PriceResult {
             message: Some(message.into()),
             listings: Vec::new(),
             total: None,
+            relaxed: None,
+            trade_url: None,
+            site_query: None,
             parsed_stats: Vec::new(),
             base_properties: Vec::new(),
             league: league.to_string(),
@@ -178,6 +203,8 @@ impl PriceResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PriceSheet {
+    /// `"ru"` when names were translated (the panel then localizes its own labels).
+    pub lang: String,
     pub league: String,
     pub category: String,
     pub groups: Vec<SheetGroupInfo>,
@@ -214,6 +241,9 @@ fn bulk_result(
         message: None,
         listings: vec![listing],
         total: None,
+        relaxed: None,
+        trade_url: None,
+        site_query: None,
         parsed_stats: Vec::new(),
         base_properties: Vec::new(),
         league,
@@ -366,6 +396,8 @@ struct ItemsResponse {
 /// single async mutex; price checks are serialized by the hotkey so contention is nil.
 struct Caches {
     stats: Option<(Instant, Arc<Vec<StatEntry>>)>,
+    /// trade2 currency id → icon URL (`data/static`).
+    icons: Option<(Instant, Arc<HashMap<String, String>>)>,
     items: Option<(Instant, Arc<Vec<String>>)>,
     leagues: Option<(Instant, Vec<String>)>,
     rates: HashMap<String, f64>,
@@ -395,6 +427,7 @@ impl Default for Caches {
     fn default() -> Self {
         Caches {
             stats: None,
+            icons: None,
             items: None,
             leagues: None,
             // Seed with the reference's static fallback so bulk pricing degrades
@@ -437,6 +470,16 @@ pub struct Pricing {
     /// The last item priced, so the T5 requery can re-price it with edited filters /
     /// a new league without the frontend round-tripping the whole item.
     last_item: Mutex<Option<ParsedItem>>,
+    /// Russian→English tables for a Russian game client ([`i18n`]); fetched on the
+    /// first Russian copy, refreshed daily like the rest of the trade2 data.
+    ru: AsyncMutex<Option<(Instant, Arc<i18n::RuDict>)>>,
+    /// English line → Russian original for the last localized copy; relabels the
+    /// card (stat rows, class/base/name) so a Russian player reads their own wording.
+    /// Empty after an English copy.
+    labels: Mutex<HashMap<String, String>>,
+    /// Russian UI: set by `POE2_OVERLAY_LANG=ru` or sticky once a Russian copy is
+    /// seen — drives the price-sheet names and the waystone danger texts.
+    ru_mode: std::sync::atomic::AtomicBool,
 }
 
 impl Pricing {
@@ -453,7 +496,139 @@ impl Pricing {
             rate: Mutex::new(RateLimit::default()),
             league: Mutex::new(None),
             last_item: Mutex::new(None),
+            ru: AsyncMutex::new(None),
+            labels: Mutex::new(HashMap::new()),
+            ru_mode: std::sync::atomic::AtomicBool::new(
+                std::env::var("POE2_OVERLAY_LANG").is_ok_and(|l| l.starts_with("ru")),
+            ),
         }
+    }
+
+    /// Translate a Russian item copy to the English clipboard format the parser and
+    /// pricers expect; any other text is returned unchanged. If the reference data
+    /// can't be fetched the text passes through (and the parser rejects it as before).
+    pub async fn localize(&self, text: &str) -> String {
+        *self.labels.lock().unwrap_or_else(|e| e.into_inner()) = HashMap::new();
+        if !i18n::is_russian(text) {
+            return text.to_string();
+        }
+        self.ru_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+        match self.ru_dict().await {
+            Some(d) => {
+                let (en, labels) = d.translate_labeled(text);
+                *self.labels.lock().unwrap_or_else(|e| e.into_inner()) = labels;
+                en
+            }
+            None => text.to_string(),
+        }
+    }
+
+    /// Whether the overlay should speak Russian (see `ru_mode`).
+    pub fn is_ru(&self) -> bool {
+        self.ru_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The Russian↔English tables, fetched on first use and refreshed daily.
+    async fn ru_dict(&self) -> Option<Arc<i18n::RuDict>> {
+        let mut slot = self.ru.lock().await;
+        if !fresh(&slot, TRADE_DATA_TTL) {
+            match fetch_ru_dict(&self.client).await {
+                Some(d) => *slot = Some((Instant::now(), Arc::new(d))),
+                None => eprintln!("[i18n] could not fetch trade2 reference data"),
+            }
+        }
+        slot.as_ref().map(|(_, d)| d.clone())
+    }
+
+    /// Russian original of a translated line (a waystone mod), else the line itself.
+    pub fn relabel_line(&self, en: &str) -> String {
+        self.labels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(en)
+            .cloned()
+            .unwrap_or_else(|| en.to_string())
+    }
+
+    /// Attach currency icon URLs to the listings (the map is loaded with the other
+    /// trade2 reference data by `ensure_caches`, which every pricing path ran first).
+    async fn with_icons(&self, mut res: PriceResult) -> PriceResult {
+        let icons = self
+            .cache
+            .lock()
+            .await
+            .icons
+            .as_ref()
+            .map(|(_, m)| m.clone());
+        if let Some(icons) = icons {
+            for l in &mut res.listings {
+                l.icon = icons.get(&l.currency).cloned();
+                if l.equiv.is_some() {
+                    l.equiv_icon = icons.get("exalted").cloned();
+                }
+            }
+        }
+        res
+    }
+
+    /// Display name for the loading card, in the player's language when localized.
+    pub fn display_name(&self, item: &ParsedItem) -> String {
+        self.relabel_name(&display_name(item))
+    }
+
+    pub fn relabel_name(&self, name: &str) -> String {
+        let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = name.to_string();
+        // Longest first so a base inside a unique name is not replaced piecemeal.
+        let mut pairs: Vec<(&String, &String)> = labels.iter().collect();
+        pairs.sort_by_key(|(en, _)| std::cmp::Reverse(en.len()));
+        for (en, ru) in pairs {
+            if out.contains(en.as_str()) {
+                out = out.replace(en.as_str(), ru);
+            }
+        }
+        out
+    }
+
+    /// Swap the English texts on a fresh result for the Russian originals. Only the
+    /// display `text` fields change — ids/values that build the query stay English.
+    fn relabel(&self, mut res: PriceResult) -> PriceResult {
+        {
+            let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+            if labels.is_empty() {
+                return res;
+            }
+            for s in &mut res.parsed_stats {
+                if let Some(ru) = labels.get(&s.text) {
+                    s.text = ru.clone();
+                }
+            }
+            for b in &mut res.base_properties {
+                if let Some(ru) = labels.get(&b.text) {
+                    b.text = ru.clone();
+                }
+            }
+        }
+        res.item = self.relabel_name(&res.item);
+        // A Russian client player gets the Russian trade site. Its search ids are the
+        // gzipped query itself, but with Russian base/unique names — an English
+        // `type` makes the ru. site reject the search — so rebuild the id locally.
+        if let Some(q) = res.site_query.as_ref() {
+            let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = q.clone();
+            for key in ["type", "name"] {
+                if let Some(ru) = q[key].as_str().and_then(|en| labels.get(en)) {
+                    q[key] = serde_json::Value::String(ru.clone());
+                }
+            }
+            if let Some(id) = site_search_id(&q) {
+                res.trade_url = Some(format!(
+                    "https://ru.pathofexile.com/trade2/search/poe2/{}/{id}",
+                    urlencoding::encode(&res.league)
+                ));
+            }
+        }
+        res
     }
 
     /// Override the active league (T5 league selector). `None` reverts to auto
@@ -473,6 +648,12 @@ impl Pricing {
     /// IP-rate-limit lockout. Never panics — failures become an `Empty`/`Error`/
     /// `RateLimited` result the overlay renders as text.
     pub async fn price(&self, item: &ParsedItem) -> PriceResult {
+        let res = self.price_inner(item).await;
+        let res = self.relabel(res);
+        self.with_icons(res).await
+    }
+
+    async fn price_inner(&self, item: &ParsedItem) -> PriceResult {
         // Remember the item so T5's requery can re-price it with edited filters.
         *self.last_item.lock().unwrap_or_else(|e| e.into_inner()) = Some(item.clone());
 
@@ -527,7 +708,20 @@ impl Pricing {
             }
         }
         .unwrap_or_default();
+        let mut entries = entries;
+        let mut lang = "en";
+        if self.is_ru() {
+            if let Some(d) = self.ru_dict().await {
+                lang = "ru";
+                for e in &mut entries {
+                    if let Some(ru) = d.ru_name(&e.name) {
+                        e.name = ru;
+                    }
+                }
+            }
+        }
         PriceSheet {
+            lang: lang.to_string(),
             league: snapshot.league,
             category: label.to_string(),
             groups: ninja::SHEET_GROUPS
@@ -546,6 +740,17 @@ impl Pricing {
     /// uses it too), then re-runs: bulk via poe.ninja for the new league, gear via the
     /// trade2 query built from the *edited* stats/base. Honors the IP lockout.
     pub async fn requery(
+        &self,
+        league: String,
+        parsed_stats: Vec<ParsedStat>,
+        base_properties: Vec<BaseProp>,
+    ) -> PriceResult {
+        let res = self.requery_inner(league, parsed_stats, base_properties).await;
+        let res = self.relabel(res);
+        self.with_icons(res).await
+    }
+
+    async fn requery_inner(
         &self,
         league: String,
         parsed_stats: Vec<ParsedStat>,
@@ -588,6 +793,9 @@ impl Pricing {
                 message: Some(format!("Rate limit approaching — wait {wait}s")),
                 listings: Vec::new(),
                 total: None,
+                relaxed: None,
+                trade_url: None,
+                site_query: None,
                 parsed_stats,
                 base_properties,
                 league: lg,
@@ -603,6 +811,7 @@ impl Pricing {
             base_properties,
             &snapshot,
             &self.rate,
+            None,
         )
         .await
     }
@@ -627,6 +836,13 @@ impl Pricing {
                 c.items = Some((Instant::now(), Arc::new(items)));
             } else if c.items.is_none() {
                 c.items = Some((Instant::now(), Arc::new(Vec::new())));
+            }
+        }
+        if !fresh(&c.icons, TRADE_DATA_TTL) {
+            if let Some(icons) = fetch_icons(&self.client).await {
+                c.icons = Some((Instant::now(), Arc::new(icons)));
+            } else if c.icons.is_none() {
+                c.icons = Some((Instant::now(), Arc::new(HashMap::new())));
             }
         }
         if !fresh(&c.leagues, TRADE_DATA_TTL) {
@@ -726,6 +942,63 @@ async fn fetch_stats(client: &reqwest::Client) -> Option<Vec<StatEntry>> {
             .flat_map(|c| c.entries)
             .collect(),
     )
+}
+
+async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<serde_json::Value> {
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
+/// Fetch the `www.` + `ru.` trade2 reference data and build the translation tables.
+async fn fetch_ru_dict(client: &reqwest::Client) -> Option<i18n::RuDict> {
+    let get = |host: &str, what: &str| {
+        format!("https://{host}.pathofexile.com/api/trade2/data/{what}")
+    };
+    // Sequential on purpose: once a day, and it keeps the burst on GGG's data API small.
+    let stats_en = fetch_json(client, &get("www", "stats")).await;
+    let stats_ru = fetch_json(client, &get("ru", "stats")).await;
+    let items_en = fetch_json(client, &get("www", "items")).await;
+    let items_ru = fetch_json(client, &get("ru", "items")).await;
+    let static_en = fetch_json(client, &get("www", "static")).await;
+    let static_ru = fetch_json(client, &get("ru", "static")).await;
+    let filters_ru = fetch_json(client, &get("ru", "filters")).await;
+    Some(i18n::RuDict::build(
+        &stats_en?, &stats_ru?, &items_en?, &items_ru?, &static_en?, &static_ru?, &filters_ru?,
+    ))
+}
+
+/// A trade-site search id: the `query` JSON, gzipped, URL-safe base64 without padding
+/// (what `/api/trade2/search` returns — the site decodes it, nothing is stored).
+fn site_search_id(query: &serde_json::Value) -> Option<String> {
+    use base64::Engine;
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gz.write_all(serde_json::to_string(query).ok()?.as_bytes()).ok()?;
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(gz.finish().ok()?))
+}
+
+/// trade2 `data/static` → currency id → absolute icon URL.
+async fn fetch_icons(client: &reqwest::Client) -> Option<HashMap<String, String>> {
+    let v = fetch_json(client, "https://www.pathofexile.com/api/trade2/data/static").await?;
+    let icons: HashMap<String, String> = v["result"]
+        .as_array()?
+        .iter()
+        .flat_map(|c| c["entries"].as_array().into_iter().flatten())
+        .filter_map(|e| {
+            let id = e["id"].as_str()?;
+            let img = e["image"].as_str()?;
+            let url = if img.starts_with("http") {
+                img.to_string()
+            } else {
+                format!("https://web.poecdn.com{img}")
+            };
+            Some((id.to_string(), url))
+        })
+        .collect();
+    (!icons.is_empty()).then_some(icons)
 }
 
 async fn fetch_items(client: &reqwest::Client) -> Option<Vec<String>> {
@@ -942,6 +1215,19 @@ mod rate_tests {
         // State field 2 = 120s of restriction already in force (limit not near cap).
         r.apply_headers(&headers("8:10:0", "0:10:120"));
         assert!((119..=120).contains(&r.wait_secs().unwrap()));
+    }
+
+    #[test]
+    fn site_search_id_roundtrips() {
+        use base64::Engine;
+        use std::io::Read;
+        let q = serde_json::json!({"status": {"option": "securable"}, "type": "Золотое кольцо"});
+        let id = super::site_search_id(&q).expect("encodes");
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&id).unwrap();
+        let mut s = String::new();
+        flate2::read::GzDecoder::new(&raw[..]).read_to_string(&mut s).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&s).unwrap(), q);
+        assert!(id.starts_with("H4sI"));
     }
 
     #[test]

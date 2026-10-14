@@ -7,6 +7,8 @@
 //! prices it against the GGG trade2 API + poe.ninja (`trade`). The pieces are
 //! stubbed here and wired per the active plan (T2-T4).
 
+#[cfg(target_os = "linux")]
+mod gamepad;
 mod cheatsheet;
 mod clipboard;
 mod danger;
@@ -121,6 +123,9 @@ pub fn run() {
             }
             // Warm pricing client + caches kept in state across checks (T4, ADR-0004).
             app.manage(trade::Pricing::new());
+            // Controller players: right stick scrolls / B closes the visible card.
+            #[cfg(target_os = "linux")]
+            gamepad::spawn(app.handle().clone());
             // Persistent X11 clipboard owner for the regex cheat-sheet write (T8, ADR-0006).
             match clipboard::Clip::build() {
                 Ok(clip) => {

@@ -6,6 +6,7 @@
 // (an explicit button — auto-requery on every keystroke would risk the GGG IP limit;
 // changing the league requeries directly since it is a single deliberate action).
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -13,6 +14,11 @@ interface Listing {
   display: string;
   exaltVal: number;
   age: string;
+  amount: string;
+  currency: string;
+  equiv: string | null;
+  icon: string | null;
+  equivIcon: string | null;
 }
 interface ParsedStat {
   id: string;
@@ -35,6 +41,8 @@ interface PriceResult {
   message: string | null;
   listings: Listing[];
   total: number | null;
+  relaxed: string | null;
+  tradeUrl: string | null;
   parsedStats: ParsedStat[];
   baseProperties: BaseProp[];
   league: string;
@@ -48,6 +56,7 @@ interface DangerFlag {
   why: string;
 }
 interface DangerReport {
+  lang: string;
   item: string;
   level: DangerLevel;
   flags: DangerFlag[];
@@ -75,10 +84,48 @@ interface SheetGroup {
   categories: string[];
 }
 interface PriceSheet {
+  lang: string;
   league: string;
   category: string;
   groups: SheetGroup[];
   entries: SheetEntry[];
+}
+
+// Russian labels for the two panels whose content the backend localizes (waystone
+// danger, price sheet) — shown when the payload says `lang: "ru"`. Category keys stay
+// English: they are what `get_price_sheet` takes.
+const RU_LABELS: Record<string, string> = {
+  safe: "Безопасно",
+  caution: "Осторожно",
+  dangerous: "Опасно",
+  deadly: "Смертельно",
+  General: "Общее",
+  Gems: "Камни",
+  Equipment: "Снаряжение",
+  Atlas: "Атлас",
+  Runes: "Руны",
+  Currency: "Валюта",
+  Fragments: "Фрагменты",
+  Essences: "Сущности",
+  Omens: "Предсказания",
+  "Soul Cores": "Ядра душ",
+  Abyss: "Бездна",
+  Breach: "Разлом",
+  Delirium: "Делириум",
+  Idols: "Идолы",
+  "Uncut Gems": "Неогранённые камни",
+  "Lineage Gems": "Династические камни",
+  "Unique Weapons": "Уникальное оружие",
+  "Unique Armours": "Уникальные доспехи",
+  "Unique Accessories": "Уникальная бижутерия",
+  "Unique Jewels": "Уникальные самоцветы",
+  "Unique Flasks": "Уникальные флаконы",
+  "Precursor Tablets": "Плитки предтеч",
+  "Unique Tablets": "Уникальные плитки",
+  Expedition: "Экспедиция",
+};
+function tr(lang: string | undefined, key: string): string {
+  return lang === "ru" ? (RU_LABELS[key] ?? key) : key;
 }
 
 const itemName = ref("");
@@ -158,13 +205,16 @@ const nameParts = computed(() => {
 // of the item's value.
 const spread = computed(() => {
   const r = result.value;
-  if (!r || r.listings.length < 2) return "";
+  if (!r || r.listings.length === 0 || (r.listings.length < 2 && !r.relaxed)) return "";
   const lo = r.listings[0].display;
   const hi = r.listings[r.listings.length - 1].display;
   const range = lo === hi ? lo : `${lo} – ${hi}`;
+  // The exact search found nothing and the backend loosened it — say how, since the
+  // checked filters alone no longer describe what was matched.
+  const relaxed = r.relaxed ? ` · relaxed: ${r.relaxed}` : "";
   return r.total && r.total > r.listings.length
-    ? `${range} · cheapest ${r.listings.length} of ${r.total} matches`
-    : `${range} · ${r.listings.length} matches`;
+    ? `${range} · cheapest ${r.listings.length} of ${r.total} matches${relaxed}`
+    : `${range} · ${r.listings.length} matches${relaxed}`;
 });
 
 // Sheet-name matching ignores case and apostrophes: poe.ninja ids lose the apostrophe
@@ -172,9 +222,10 @@ const spread = computed(() => {
 const filteredEntries = computed(() => {
   const sheet = priceSheet.value;
   if (!sheet) return [];
-  const q = sheetFilter.value.toLowerCase().replace(/'/g, "").trim();
+  const norm = (t: string) => t.toLowerCase().replace(/'/g, "").replace(/ё/g, "е");
+  const q = norm(sheetFilter.value).trim();
   if (!q) return sheet.entries;
-  return sheet.entries.filter((e) => e.name.toLowerCase().replace(/'/g, "").includes(q));
+  return sheet.entries.filter((e) => norm(e.name).includes(q));
 });
 
 // The group whose category chips are shown: the one containing the active category.
@@ -269,6 +320,17 @@ function hide() {
   invoke("hide_overlay");
 }
 
+// The last search (gear only — poe.ninja prices have no trade query) in the browser.
+async function openTrade() {
+  const url = result.value?.tradeUrl;
+  if (!url) return;
+  try {
+    await openUrl(url);
+  } catch (e) {
+    console.error("open trade failed", e);
+  }
+}
+
 // Human label for a base-property filter so each checkbox says what it matches, not
 // just a bare value (the id is the stable key from the backend's build_base_properties).
 function propKind(id: string): string {
@@ -301,6 +363,12 @@ function onKey(e: KeyboardEvent) {
 
 onMounted(async () => {
   window.addEventListener("keydown", onKey);
+  // Right stick / D-pad from the backend's gamepad thread (only while the card is up).
+  unlisten.push(
+    await listen<number>("gamepad-scroll", (e) => {
+      document.querySelector(".card")?.scrollBy({ top: e.payload });
+    }),
+  );
   unlisten.push(
     await listen<string>("price-check-loading", (e) => {
       reqGen.value++; // invalidate any in-flight requery for the previous item
@@ -421,11 +489,11 @@ onUnmounted(() => {
 
       <template v-else-if="priceSheet">
         <header class="head">
-          <div class="name">{{ priceSheet.category }}</div>
+          <div class="name">{{ tr(priceSheet.lang, priceSheet.category) }}</div>
           <div class="sheet-league">
             {{ priceSheet.league }} · poe.ninja ·
             <button class="sheet-toggle" @click="catsOpen = !catsOpen">
-              {{ catsOpen ? "▾ categories" : "▸ categories" }}
+              {{ (catsOpen ? "▾ " : "▸ ") + (priceSheet.lang === "ru" ? "категории" : "categories") }}
             </button>
           </div>
         </header>
@@ -439,7 +507,7 @@ onUnmounted(() => {
               :disabled="sheetBusy"
               @click="switchGroup(g)"
             >
-              {{ g.name }}
+              {{ tr(priceSheet.lang, g.name) }}
             </button>
           </div>
           <div class="sheet-cats">
@@ -451,7 +519,7 @@ onUnmounted(() => {
               :disabled="sheetBusy"
               @click="switchCategory(c)"
             >
-              {{ c }}
+              {{ tr(priceSheet.lang, c) }}
             </button>
           </div>
         </template>
@@ -459,7 +527,7 @@ onUnmounted(() => {
           v-model="sheetFilter"
           class="sheet-filter"
           type="text"
-          placeholder="Filter by name… (e.g. craiceann)"
+          :placeholder="priceSheet.lang === 'ru' ? 'Фильтр по названию…' : 'Filter by name… (e.g. craiceann)'"
         />
         <ul v-if="filteredEntries.length" class="listings" :class="{ stale: sheetBusy }">
           <li v-for="e in filteredEntries" :key="e.name" class="listing">
@@ -467,9 +535,15 @@ onUnmounted(() => {
             <span class="price">{{ e.display }}</span>
           </li>
         </ul>
-        <div v-else-if="priceSheet.entries.length" class="status">Nothing matches the filter.</div>
+        <div v-else-if="priceSheet.entries.length" class="status">
+          {{ priceSheet.lang === "ru" ? "Ничего не найдено." : "Nothing matches the filter." }}
+        </div>
         <div v-else class="status err">
-          poe.ninja unreachable — pick another category or press Ctrl+Alt+F to retry.
+          {{
+            priceSheet.lang === "ru"
+              ? "poe.ninja недоступен — выберите другую категорию или нажмите Ctrl+Alt+F ещё раз."
+              : "poe.ninja unreachable — pick another category or press Ctrl+Alt+F to retry."
+          }}
         </div>
       </template>
 
@@ -481,6 +555,7 @@ onUnmounted(() => {
           <div class="hint-row"><kbd>Ctrl+Alt+D</kbd><span>price-check the hovered item</span></div>
           <div class="hint-row"><kbd>Ctrl+Alt+F</kbd><span>open the price sheet</span></div>
           <div class="hint-row"><kbd>Ctrl+Alt+X</kbd><span>hide the overlay</span></div>
+          <div class="hint-row"><kbd>R-stick / B</kbd><span>scroll / close (gamepad)</span></div>
         </div>
       </template>
 
@@ -490,7 +565,7 @@ onUnmounted(() => {
             <div>{{ nameParts[0] }}</div>
             <div v-if="nameParts[1]" class="name-base">{{ nameParts[1] }}</div>
           </div>
-          <span class="level" :class="danger.level">{{ danger.level }}</span>
+          <span class="level" :class="danger.level">{{ tr(danger.lang, danger.level) }}</span>
         </header>
         <ul v-if="danger.flags.length" class="flags">
           <li v-for="(f, i) in danger.flags" :key="i" class="flag" :class="f.severity">
@@ -502,7 +577,9 @@ onUnmounted(() => {
             </div>
           </li>
         </ul>
-        <div v-else class="status safe">No dangerous mods — safe to run.</div>
+        <div v-else class="status safe">
+          {{ danger.lang === "ru" ? "Опасных свойств нет — можно проходить." : "No dangerous mods — safe to run." }}
+        </div>
       </template>
 
       <template v-else>
@@ -540,9 +617,19 @@ onUnmounted(() => {
             <input v-model="st.max" class="num" placeholder="max" :disabled="busy || !st.active" />
           </div>
 
-          <button class="requery" :disabled="busy || rateWait > 0" @click="requery">
-            {{ busy ? "Searching…" : rateWait > 0 ? `Wait ${rateWait}s…` : "Search again" }}
-          </button>
+          <div class="actions">
+            <button class="requery" :disabled="busy || rateWait > 0" @click="requery">
+              {{ busy ? "Searching…" : rateWait > 0 ? `Wait ${rateWait}s…` : "Search again" }}
+            </button>
+            <button
+              class="requery"
+              :disabled="busy || !result?.tradeUrl"
+              title="Open this search on the trade site"
+              @click="openTrade"
+            >
+              Open on trade
+            </button>
+          </div>
         </section>
 
         <div v-if="loading" class="status searching">Searching market…</div>
@@ -551,7 +638,15 @@ onUnmounted(() => {
           <div v-if="spread" class="spread" :class="{ stale: busy }">{{ spread }}</div>
           <ul v-if="result.listings.length" class="listings" :class="{ stale: busy }">
             <li v-for="(l, i) in result.listings" :key="i" class="listing">
-              <span class="price">{{ l.display }}</span>
+              <!-- Game-style "12× (orb icon)"; the text display is the fallback when
+                   the trade2 icon map is unavailable. -->
+              <span v-if="l.icon" class="price">
+                {{ l.amount }}×<img class="cur" :src="l.icon" :alt="l.currency" :title="l.currency" />
+                <span v-if="l.equiv" class="equiv">
+                  ({{ l.equiv }}<img v-if="l.equivIcon" class="cur small" :src="l.equivIcon" alt="exalted" /><template v-else> E</template>)
+                </span>
+              </span>
+              <span v-else class="price">{{ l.display }}</span>
               <span v-if="l.age" class="age">{{ l.age }}</span>
             </li>
           </ul>
@@ -911,9 +1006,14 @@ body,
 }
 
 /* Bronze action button — the PoE panel-button idiom, not a flat accent fill. */
-.requery {
-  align-self: flex-start;
+.actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
   margin-top: 6px;
+}
+
+.requery {
   padding: 6px 18px 7px;
   border: 1px solid var(--edge);
   border-radius: 3px;
@@ -1101,7 +1201,7 @@ body,
 .listing {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   padding: 5px 0;
   border-bottom: 1px solid rgba(200, 170, 109, 0.12);
 }
@@ -1115,6 +1215,24 @@ body,
 .listing:first-child .price {
   font-size: 16px;
   color: #f4e7c3;
+}
+
+/* Currency orb next to the amount, sized to the line like the in-game price tag. */
+.cur {
+  width: 24px;
+  height: 24px;
+  margin-left: 2px;
+  vertical-align: middle;
+}
+.cur.small {
+  width: 18px;
+  height: 18px;
+}
+.equiv {
+  margin-left: 6px;
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--ink-dim);
 }
 
 .age {

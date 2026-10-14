@@ -13,7 +13,11 @@ fn main() {
     #[cfg(target_os = "linux")]
     {
         std::env::set_var("GDK_BACKEND", "wayland");
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // Default only — an explicit value from the launcher wins, so the renderer can
+        // be switched per machine (`=0` re-enables DMA-BUF) without a rebuild.
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
     }
 
     poe2_overlay_lib::run()

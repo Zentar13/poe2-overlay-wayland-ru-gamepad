@@ -245,18 +245,26 @@ pub async fn price_bulk(
 
     let exalt_val = exalt_val?;
     let divine = rates.get("divine").copied().unwrap_or(193.0);
-    let display = if ninja_id == "exalted" {
-        "1 E".to_string()
+    let (amount, currency) = if ninja_id == "exalted" {
+        ("1".to_string(), "exalted")
     } else if ninja_id == "divine" {
-        "1 D".to_string()
+        ("1".to_string(), "divine")
+    } else if exalt_val >= divine {
+        (round2(exalt_val / divine).to_string(), "divine")
     } else {
-        display_value(exalt_val, divine)
+        (round2(exalt_val).to_string(), "exalted")
     };
+    let display = format!("{amount} {}", if currency == "divine" { "D" } else { "E" });
 
     Some(Listing {
         display,
         exalt_val,
         age: "poe.ninja avg".to_string(),
+        amount,
+        currency: currency.to_string(),
+        equiv: None,
+        icon: None,
+        equiv_icon: None,
     })
 }
 

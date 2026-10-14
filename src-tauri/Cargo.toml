@@ -28,6 +28,8 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 urlencoding = "2"                # percent-encode the league into the trade2 search path segment
 regex = "1"                      # item-text + stat-line parsing (level/quality/tier/value extraction)
+flate2 = "1"                     # gzip the search JSON into a trade-site link id (ru. site needs Russian names)
+base64 = "0.22"
 
 # --- Linux platform seams (ADR-0001/0002; Windows counterparts land in plan 0002) ---
 # The layer-shell + GTK deps need system libs: `pacman -S gtk-layer-shell gtk3`.
@@ -43,3 +45,4 @@ gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
 # via uinput and read the X11 clipboard. No /dev/input reads — only /dev/uinput.
 evdev = "0.12"                   # uinput virtual device (Ctrl+C synth); /dev/uinput ACL, no `input` group
 x11-clipboard = "0.9"            # read the X11 CLIPBOARD selection (XWayland/Proton writes there)
+libc = "0.2"                     # O_NONBLOCK on the gamepad evdev fd (gamepad.rs)

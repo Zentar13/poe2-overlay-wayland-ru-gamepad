@@ -18,6 +18,8 @@ use super::{
 };
 
 const SEARCH_BASE: &str = "https://www.pathofexile.com/api/trade2/search/poe2/";
+/// The same search on the website (the "Open on trade" button).
+const SITE_BASE: &str = "https://www.pathofexile.com/trade2/search/poe2/";
 const FETCH_BASE: &str = "https://www.pathofexile.com/api/trade2/fetch/";
 
 /// Map a PoE2 item class to its trade2 category id (`""` → no mapping).
@@ -86,16 +88,90 @@ pub async fn price_gear(
     let parsed_stats = build_parsed_stats(&mapper, item, is_equip);
     let base_properties = build_base_properties(item, &base_type);
 
-    run_gear_query(
+    let name = display_name(item);
+    let first = run_gear_query(
         client,
         league,
-        display_name(item),
-        parsed_stats,
-        base_properties,
+        name.clone(),
+        parsed_stats.clone(),
+        base_properties.clone(),
         snapshot,
         rate,
+        None,
     )
-    .await
+    .await;
+    if first.status != PriceStatus::Empty || !first.listings.is_empty() {
+        return first;
+    }
+    relax_search(client, league, name, parsed_stats, base_properties, snapshot, rate)
+        .await
+        .unwrap_or(first)
+}
+
+/// The exact search came back empty (common for rares with several high rolls). Loosen
+/// it step by step, the way poe2-voice's `poe2-trade` does: drop the socketed-rune /
+/// enchant lines (they can be swapped, so they barely move the price), then accept any
+/// N-1, then any N-2 of the N remaining mods. Each step is one more GGG search, so it
+/// stops at the first hit and never runs while the IP-rate lockout is armed. Returns
+/// `None` when nothing matched, so the caller keeps the original "no listings" card.
+#[allow(clippy::too_many_arguments)]
+async fn relax_search(
+    client: &reqwest::Client,
+    league: &str,
+    name: String,
+    mut parsed_stats: Vec<ParsedStat>,
+    base_properties: Vec<BaseProp>,
+    snapshot: &CacheSnapshot,
+    rate: &Mutex<RateLimit>,
+) -> Option<PriceResult> {
+    let swappable = |s: &ParsedStat| {
+        s.id.starts_with("rune.") || s.id.starts_with("enchant.") || s.id.starts_with("skill.")
+    };
+    let mut dropped = false;
+    for s in parsed_stats.iter_mut().filter(|s| s.active && swappable(s)) {
+        s.active = false;
+        dropped = true;
+    }
+    let n = parsed_stats.iter().filter(|s| s.active).count();
+
+    let mut steps: Vec<(Option<usize>, String)> = Vec::new();
+    if dropped && n > 0 {
+        steps.push((None, "without rune / enchant mods".into()));
+    }
+    if n >= 3 {
+        steps.push((Some(n - 1), format!("any {} of {n} mods", n - 1)));
+    }
+    if n >= 4 {
+        steps.push((Some(n - 2), format!("any {} of {n} mods", n - 2)));
+    }
+
+    for (need, label) in steps {
+        if rate.lock().unwrap_or_else(|e| e.into_inner()).wait_secs().is_some() {
+            return None;
+        }
+        let mut res = run_gear_query(
+            client,
+            league,
+            name.clone(),
+            parsed_stats.clone(),
+            base_properties.clone(),
+            snapshot,
+            rate,
+            need,
+        )
+        .await;
+        match res.status {
+            PriceStatus::Success => {
+                eprintln!("[gear] relaxed search hit: {label}");
+                res.relaxed = Some(label);
+                return Some(res);
+            }
+            PriceStatus::Empty => continue,
+            // Rate-limited / error: surface it rather than hide it behind "no listings".
+            _ => return Some(res),
+        }
+    }
+    None
 }
 
 /// Run a trade2 search+fetch from already-built stat + base-property filters — the
@@ -110,8 +186,9 @@ pub async fn run_gear_query(
     base_properties: Vec<BaseProp>,
     snapshot: &CacheSnapshot,
     rate: &Mutex<RateLimit>,
+    need: Option<usize>,
 ) -> PriceResult {
-    let query = build_query(&parsed_stats, &base_properties);
+    let query = build_query(&parsed_stats, &base_properties, need);
 
     // --- search ---
     let search_url = format!("{SEARCH_BASE}{}", urlencoding::encode(league));
@@ -201,9 +278,11 @@ pub async fn run_gear_query(
         .unwrap_or_default();
     let query_id = data.get("id").and_then(|v| v.as_str()).unwrap_or_default();
     let total = data.get("total").and_then(|v| v.as_u64());
+    let trade_url = (!query_id.is_empty())
+        .then(|| format!("{SITE_BASE}{}/{query_id}", urlencoding::encode(league)));
 
     if result_ids.is_empty() {
-        return result(
+        let mut res = result(
             &name,
             league,
             PriceStatus::Empty,
@@ -213,6 +292,9 @@ pub async fn run_gear_query(
             base_properties,
             snapshot,
         );
+        res.trade_url = trade_url;
+        res.site_query = Some(query["query"].clone());
+        return res;
     }
 
     // --- fetch (cheapest 10) ---
@@ -277,6 +359,8 @@ pub async fn run_gear_query(
         snapshot,
     );
     res.total = total;
+    res.trade_url = trade_url;
+    res.site_query = Some(query["query"].clone());
     res
 }
 
@@ -412,8 +496,9 @@ fn build_base_properties(item: &ParsedItem, base_type: &str) -> Vec<BaseProp> {
 }
 
 /// Assemble the trade2 search payload from the active stats + base properties,
-/// pruning any filter group left empty.
-fn build_query(parsed_stats: &[ParsedStat], base_properties: &[BaseProp]) -> Value {
+/// pruning any filter group left empty. `need` = match at least that many of the active
+/// stats (a trade2 `count` group) instead of all of them.
+fn build_query(parsed_stats: &[ParsedStat], base_properties: &[BaseProp], need: Option<usize>) -> Value {
     let mut query = json!({
         "query": {
             "status": {"option": "securable"},
@@ -488,7 +573,12 @@ fn build_query(parsed_stats: &[ParsedStat], base_properties: &[BaseProp]) -> Val
         })
         .collect();
     if !stat_filters.is_empty() {
-        query["query"]["stats"] = json!([{"type": "and", "filters": stat_filters}]);
+        query["query"]["stats"] = match need {
+            Some(n) if n < stat_filters.len() => {
+                json!([{"type": "count", "value": {"min": n}, "filters": stat_filters}])
+            }
+            _ => json!([{"type": "and", "filters": stat_filters}]),
+        };
     }
 
     // Drop filter groups that ended up empty (the API rejects empty filter objects).
@@ -550,8 +640,11 @@ fn normalize_listings(body: &Value, rates: &std::collections::HashMap<String, f6
         let exalt_val = amt * rates.get(&cur).copied().unwrap_or(0.0);
         let sym = currency_symbol(&cur);
         let mut display = format!("{} {sym}", trim_num(amt));
+        let mut equiv = None;
         if sym != "E" && sym != "D" {
-            display = format!("{display} ({} E)", super::round2(exalt_val));
+            let e = super::round2(exalt_val).to_string();
+            display = format!("{display} ({e} E)");
+            equiv = Some(e);
         }
         let age = listing
             .get("indexed")
@@ -562,6 +655,11 @@ fn normalize_listings(body: &Value, rates: &std::collections::HashMap<String, f6
             display,
             exalt_val,
             age,
+            amount: trim_num(amt),
+            currency: cur,
+            equiv,
+            icon: None,
+            equiv_icon: None,
         });
     }
     prices.sort_by(|a, b| a.exalt_val.total_cmp(&b.exalt_val));
@@ -654,6 +752,9 @@ fn result(
         league: league.to_string(),
         leagues: snapshot.leagues.clone(),
         total: None,
+        relaxed: None,
+        trade_url: None,
+        site_query: None,
     }
 }
 

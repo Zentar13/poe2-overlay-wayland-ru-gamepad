@@ -88,7 +88,7 @@ pub fn price_check(app: &AppHandle) {
     for i in 0..30 {
         thread::sleep(Duration::from_millis(50));
         let now = read_clipboard();
-        if now != before && now.contains("Item Class:") {
+        if now != before && is_item_copy(&now) {
             item = Some(now);
             break;
         }
@@ -105,7 +105,7 @@ pub fn price_check(app: &AppHandle) {
         // trade-off: pressing the key over *nothing* while an old item text sits on
         // the clipboard re-prices that old item — the card names the item prominently,
         // so a stale re-price is self-explanatory where a false "No item" was a dead end.
-        None if before.contains("Item Class:") => {
+        None if is_item_copy(&before) => {
             eprintln!("[hotkey] clipboard unchanged but holds an item — re-pricing it (same-item re-check)");
             before.clone()
         }
@@ -121,6 +121,17 @@ pub fn price_check(app: &AppHandle) {
     };
     eprintln!("[hotkey] price check: {} chars copied", text.len());
 
+    // A Russian game client copies Russian item text; translate it to the English
+    // format the parser and pricers speak (trade::i18n). No-op for English copies.
+    let text = match app.try_state::<trade::Pricing>() {
+        Some(pricing) if trade::is_russian(&text) => {
+            let en = tauri::async_runtime::block_on(pricing.localize(&text));
+            eprintln!("[hotkey] translated Russian copy:\n{en}");
+            en
+        }
+        _ => text,
+    };
+
     // Parse → price (T4). The parser is pure; pricing is async, so we block this
     // worker thread on Tauri's runtime (we are on a plain spawned std::thread, not a
     // runtime worker, so block_on is safe — ADR-0004).
@@ -134,7 +145,18 @@ pub fn price_check(app: &AppHandle) {
     // instant, quota-free mod analysis emitted on `price-check-danger`. Waystones are not
     // priced — the danger verdict is what matters before running one.
     if danger::is_waystone(&parsed) {
-        let report = danger::analyze(&parsed);
+        let mut report = danger::analyze(&parsed);
+        if let Some(pricing) = app.try_state::<trade::Pricing>() {
+            if pricing.is_ru() {
+                danger::to_russian(&mut report);
+                for f in &mut report.flags {
+                    if !f.matched.is_empty() {
+                        f.matched = pricing.relabel_line(&f.matched);
+                    }
+                }
+                report.item = pricing.relabel_name(&report.item);
+            }
+        }
         eprintln!(
             "[hotkey] waystone danger: {:?} ({} flag(s))",
             report.level,
@@ -147,7 +169,10 @@ pub fn price_check(app: &AppHandle) {
 
     // Two-phase contract (ADR-0004): `price-check-loading` shows the card immediately
     // while the trade2 round-trip runs; `price-check-result` carries the listings.
-    let name = trade::display_name(&parsed);
+    let name = match app.try_state::<trade::Pricing>() {
+        Some(p) => p.display_name(&parsed),
+        None => trade::display_name(&parsed),
+    };
     let _ = app.emit("price-check-loading", &name);
     show_overlay(app);
 
@@ -162,6 +187,11 @@ pub fn price_check(app: &AppHandle) {
         result.listings.len()
     );
     let _ = app.emit("price-check-result", result);
+}
+
+/// Whether clipboard text is a PoE2 item copy (English or Russian client).
+fn is_item_copy(text: &str) -> bool {
+    text.contains("Item Class:") || trade::is_russian(text)
 }
 
 /// Map the overlay surface only when hidden. Calling `show()` on an already-mapped
