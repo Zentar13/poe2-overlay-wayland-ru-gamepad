@@ -16,7 +16,8 @@ use std::collections::HashSet;
 
 use serde::Serialize;
 
-use crate::trade::{display_name, ParsedItem};
+use crate::danger_i18n;
+use crate::trade::{display_name, Lang, ParsedItem};
 
 /// How dangerous a waystone is overall (and per matched mod). `Ord` runs Safe < Caution
 /// < Dangerous < Deadly so the report level is `max` of its flags.
@@ -45,7 +46,8 @@ pub struct DangerFlag {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DangerReport {
-    /// `"ru"` once [`to_russian`] ran — the panel then localizes its own labels.
+    /// UI language code the texts are in (see [`localize`]) — the panel localizes its
+    /// own labels to match.
     pub lang: String,
     pub item: String,
     pub level: DangerLevel,
@@ -126,58 +128,17 @@ const RULES: &[Rule] = &[
         why: "Larger monster hit areas — harder to dodge" },
 ];
 
-/// Russian label + explanation per English rule/combo label (the rules match on the
-/// English mod text, so they stay keyed in English; only the output is translated).
-const RU: &[(&str, &str, &str)] = &[
-    ("Extra Chaos damage", "Дополнительный урон хаосом",
-        "Монстры добавляют хаос к каждому удару — он проходит сквозь энергетический щит, и от него трудно защититься"),
-    ("Extra Fire damage", "Дополнительный урон от огня", "Монстры добавляют урон от огня к каждому удару"),
-    ("Extra Cold damage", "Дополнительный урон от холода", "Монстры добавляют урон от холода к каждому удару"),
-    ("Extra Lightning damage", "Дополнительный урон от молнии", "Монстры добавляют урон от молнии к каждому удару"),
-    ("Monsters deal more damage", "Монстры наносят больше урона", "Получаемый урон выше во всём"),
-    ("Extra projectiles", "Дополнительные снаряды", "Попадания нескольких снарядов сразу могут убить мгновенно"),
-    ("Monster crit chance", "Шанс крита монстров", "Монстры критуют гораздо чаще — внезапные всплески урона"),
-    ("Monster crit damage", "Урон крита монстров", "Критические удары монстров бьют намного сильнее"),
-    ("Monster speed", "Скорость монстров", "Быстрее атаки, чары и передвижение — труднее уклоняться"),
-    ("Reduced recovery", "Сниженное восстановление",
-        "Восстановление здоровья и щита урезано — не вытянуть против всплесков урона"),
-    ("Elemental Weakness curse", "Проклятие «Уязвимость к стихиям»", "Снижает ваши сопротивления стихиям"),
-    ("Mark for Death", "Метка смерти",
-        "Получаемый урон повышен после убийства редкого/уникального монстра — можно умереть цепочкой"),
-    ("Delirium", "Делириум", "Более крепкие и смертоносные монстры Делириума"),
-    ("Periodic no-damage", "Периоды без урона",
-        "3 секунды из каждых 10 вы не наносите урона — получаете удары, не имея возможности ответить"),
-    ("Temporal Chains curse", "Проклятие «Оковы времени»", "Замедляет ваши действия, восстановление и действие флаконов"),
-    ("Enfeeble curse", "Проклятие «Ослабление»", "Снижает ваш урон и меткость"),
-    ("Reduced flask charges", "Меньше зарядов флаконов", "Флаконы реже доступны по ходу карты"),
-    ("Poison on hit", "Отравление при попадании", "Накапливающийся урон хаосом со временем"),
-    ("Bleed on hit", "Кровотечение при попадании", "Физический урон со временем, сильнее при движении"),
-    ("Charge steal", "Кража зарядов", "Отнимает заряды силы, ярости и выносливости посреди боя"),
-    ("Armour break", "Раскол брони", "Билды на броне теряют защиту по ходу боя"),
-    ("Grasping Vines", "Цепкие лозы", "Обездвиживают и замедляют вблизи монстров"),
-    ("Flammability", "Воспламеняемость", "Повышает получаемый урон от огня"),
-    ("Shock", "Шок", "Шок повышает получаемый урон"),
-    ("Freeze", "Заморозка", "Заморозка может обездвижить"),
-    ("Stun", "Оглушение", "Выше риск попасть в цепочку оглушений"),
-    ("Monster accuracy", "Меткость монстров", "Монстры реже промахиваются"),
-    ("Monster AoE", "Область действия монстров", "Шире зоны поражения — труднее уклониться"),
-    ("Combo: crit chance + crit damage", "Комбо: шанс и урон крита",
-        "Монстры часто критуют И бьют сильно — высокий риск умереть с одного удара"),
-    ("Combo: no sustain + amplified damage", "Комбо: нет восстановления + усиленный урон",
-        "Восстановление урезано, а получаемый урон усилен"),
-];
-
-/// Translate a report's labels/explanations to Russian (Russian game client). The
-/// matched mod lines and item name are relabelled by the caller, which holds the
-/// English→Russian line map of the copy.
-pub fn to_russian(report: &mut DangerReport) {
+/// Translate a report's labels/explanations to the UI language. The matched mod lines
+/// and item name are relabelled by the caller, which holds the copy's English→original
+/// line map.
+pub fn localize(report: &mut DangerReport, lang: Lang) {
+    report.lang = lang.code().to_string();
     for f in &mut report.flags {
-        if let Some((_, label, why)) = RU.iter().find(|(en, _, _)| *en == f.label) {
+        if let Some((label, why)) = danger_i18n::text(lang, &f.label) {
             f.label = label.to_string();
             f.why = why.to_string();
         }
     }
-    report.lang = "ru".to_string();
 }
 
 /// True if the item is a Waystone (the only class the danger-checker handles; tablets and
@@ -265,9 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn every_rule_has_a_russian_text() {
-        for r in RULES {
-            assert!(RU.iter().any(|(en, _, _)| *en == r.label), "no RU for {}", r.label);
+    fn every_rule_has_a_text_in_every_language() {
+        let combos = ["Combo: crit chance + crit damage", "Combo: no sustain + amplified damage"];
+        for lang in Lang::ALL.into_iter().filter(|l| *l != Lang::En) {
+            for label in RULES.iter().map(|r| r.label).chain(combos) {
+                assert!(danger_i18n::text(lang, label).is_some(), "no {} text for {label}", lang.code());
+            }
         }
     }
 

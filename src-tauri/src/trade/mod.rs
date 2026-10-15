@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::async_runtime::Mutex as AsyncMutex;
 
-pub use i18n::is_russian;
+pub use i18n::{detect as detect_lang, Lang};
 pub use ninja::SheetEntry;
 pub use parse::parse_item;
 
@@ -458,6 +458,11 @@ fn fresh<T>(slot: &Option<(Instant, T)>, ttl: Duration) -> bool {
 
 // --- Pricing state ---------------------------------------------------------
 
+/// Poison-recovering lock (ADR-0004 never-panics: a stray panic must not brick pricing).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Warm-client pricing state, stored in Tauri state via `app.manage(Pricing::new())`
 /// and shared by every price check (ADR-0004).
 pub struct Pricing {
@@ -470,16 +475,22 @@ pub struct Pricing {
     /// The last item priced, so the T5 requery can re-price it with edited filters /
     /// a new league without the frontend round-tripping the whole item.
     last_item: Mutex<Option<ParsedItem>>,
-    /// Russian→English tables for a Russian game client ([`i18n`]); fetched on the
-    /// first Russian copy, refreshed daily like the rest of the trade2 data.
-    ru: AsyncMutex<Option<(Instant, Arc<i18n::RuDict>)>>,
-    /// English line → Russian original for the last localized copy; relabels the
-    /// card (stat rows, class/base/name) so a Russian player reads their own wording.
-    /// Empty after an English copy.
+    /// Localized→English tables per client language ([`i18n`]); fetched on first use,
+    /// refreshed daily like the rest of the trade2 data.
+    dicts: AsyncMutex<HashMap<Lang, (Instant, Arc<i18n::LangDict>)>>,
+    /// English base type → item class (RePoE), for item classes the localized category
+    /// labels can't resolve. Fetched only when such a copy shows up.
+    base_classes: AsyncMutex<Option<(Instant, Arc<HashMap<String, String>>)>>,
+    /// English line → original for the last localized copy; relabels the card (stat
+    /// rows, class/base/name) when the UI speaks the copy's language. Empty after an
+    /// English copy.
     labels: Mutex<HashMap<String, String>>,
-    /// Russian UI: set by `POE2_OVERLAY_LANG=ru` or sticky once a Russian copy is
-    /// seen — drives the price-sheet names and the waystone danger texts.
-    ru_mode: std::sync::atomic::AtomicBool,
+    /// Language of the last item copy.
+    copy_lang: Mutex<Lang>,
+    /// UI language from the settings; `None` = auto (follow the game client).
+    ui_setting: Mutex<Option<Lang>>,
+    /// Auto-mode language: the last item copy's, seeded by `POE2_OVERLAY_LANG`.
+    seen_lang: Mutex<Option<Lang>>,
 }
 
 impl Pricing {
@@ -496,58 +507,100 @@ impl Pricing {
             rate: Mutex::new(RateLimit::default()),
             league: Mutex::new(None),
             last_item: Mutex::new(None),
-            ru: AsyncMutex::new(None),
+            dicts: AsyncMutex::new(HashMap::new()),
+            base_classes: AsyncMutex::new(None),
             labels: Mutex::new(HashMap::new()),
-            ru_mode: std::sync::atomic::AtomicBool::new(
-                std::env::var("POE2_OVERLAY_LANG").is_ok_and(|l| l.starts_with("ru")),
+            copy_lang: Mutex::new(Lang::En),
+            ui_setting: Mutex::new(None),
+            seen_lang: Mutex::new(
+                std::env::var("POE2_OVERLAY_LANG").ok().and_then(|l| Lang::from_code(&l)),
             ),
         }
     }
 
-    /// Translate a Russian item copy to the English clipboard format the parser and
-    /// pricers expect; any other text is returned unchanged. If the reference data
-    /// can't be fetched the text passes through (and the parser rejects it as before).
+    /// Translate a localized item copy to the English clipboard format the parser and
+    /// pricers expect; an English copy (or any other text) is returned unchanged. If
+    /// the reference data can't be fetched the text passes through (and the parser
+    /// rejects it as before).
     pub async fn localize(&self, text: &str) -> String {
-        *self.labels.lock().unwrap_or_else(|e| e.into_inner()) = HashMap::new();
-        if !i18n::is_russian(text) {
+        *lock(&self.labels) = HashMap::new();
+        let lang = i18n::detect(text);
+        *lock(&self.copy_lang) = lang.unwrap_or(Lang::En);
+        if lang.is_some() || text.contains("Item Class:") {
+            *lock(&self.seen_lang) = Some(lang.unwrap_or(Lang::En));
+        }
+        let Some(lang) = lang else {
             return text.to_string();
-        }
-        self.ru_mode.store(true, std::sync::atomic::Ordering::Relaxed);
-        match self.ru_dict().await {
-            Some(d) => {
-                let (en, labels) = d.translate_labeled(text);
-                *self.labels.lock().unwrap_or_else(|e| e.into_inner()) = labels;
-                en
+        };
+        let Some(dict) = self.lang_dict(lang).await else {
+            return text.to_string();
+        };
+        let known = self.base_classes.lock().await.as_ref().map(|(_, m)| m.clone());
+        let (mut en, mut labels, class_known) = dict.translate_labeled(text, known.as_deref());
+        if !class_known && known.is_none() {
+            // Class label unknown to the category table — retry with RePoE's base → class.
+            if let Some(classes) = self.load_base_classes().await {
+                (en, labels, _) = dict.translate_labeled(text, Some(&*classes));
             }
-            None => text.to_string(),
         }
+        *lock(&self.labels) = labels;
+        en
     }
 
-    /// Whether the overlay should speak Russian (see `ru_mode`).
-    pub fn is_ru(&self) -> bool {
-        self.ru_mode.load(std::sync::atomic::Ordering::Relaxed)
+    /// The UI language: the settings choice, else (auto) the last copy's language.
+    pub fn ui_lang(&self) -> Lang {
+        lock(&self.ui_setting)
+            .or(*lock(&self.seen_lang))
+            .unwrap_or(Lang::En)
     }
 
-    /// The Russian↔English tables, fetched on first use and refreshed daily.
-    async fn ru_dict(&self) -> Option<Arc<i18n::RuDict>> {
-        let mut slot = self.ru.lock().await;
+    /// The settings choice (`None` = auto).
+    pub fn ui_setting(&self) -> Option<Lang> {
+        *lock(&self.ui_setting)
+    }
+
+    pub fn set_ui_setting(&self, lang: Option<Lang>) {
+        *lock(&self.ui_setting) = lang;
+    }
+
+    /// Whether the card may show the copy's own wording: only when the UI speaks the
+    /// copy's language (otherwise the English texts stay).
+    fn copy_in_ui_lang(&self) -> bool {
+        let copy = *lock(&self.copy_lang);
+        copy != Lang::En && copy == self.ui_lang()
+    }
+
+    /// The localized↔English tables for `lang`, fetched on first use, refreshed daily.
+    async fn lang_dict(&self, lang: Lang) -> Option<Arc<i18n::LangDict>> {
+        let mut dicts = self.dicts.lock().await;
+        if !dicts.get(&lang).is_some_and(|(at, _)| at.elapsed() < TRADE_DATA_TTL) {
+            match fetch_lang_dict(&self.client, lang).await {
+                Some(d) => {
+                    dicts.insert(lang, (Instant::now(), Arc::new(d)));
+                }
+                None => eprintln!("[i18n] could not fetch trade2 reference data for {}", lang.code()),
+            }
+        }
+        dicts.get(&lang).map(|(_, d)| d.clone())
+    }
+
+    async fn load_base_classes(&self) -> Option<Arc<HashMap<String, String>>> {
+        let mut slot = self.base_classes.lock().await;
         if !fresh(&slot, TRADE_DATA_TTL) {
-            match fetch_ru_dict(&self.client).await {
-                Some(d) => *slot = Some((Instant::now(), Arc::new(d))),
-                None => eprintln!("[i18n] could not fetch trade2 reference data"),
+            if let Some(m) = fetch_base_classes(&self.client).await {
+                *slot = Some((Instant::now(), Arc::new(m)));
             }
         }
-        slot.as_ref().map(|(_, d)| d.clone())
+        slot.as_ref().map(|(_, m)| m.clone())
     }
 
-    /// Russian original of a translated line (a waystone mod), else the line itself.
+    /// Original wording of a translated line (a waystone mod) when the UI speaks the
+    /// copy's language, else the English line.
     pub fn relabel_line(&self, en: &str) -> String {
-        self.labels
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(en)
-            .cloned()
-            .unwrap_or_else(|| en.to_string())
+        if !self.copy_in_ui_lang() {
+            return en.to_string();
+        }
+        lock(&self.labels).get(en).cloned().unwrap_or_else(|| en.to_string())
     }
 
     /// Attach currency icon URLs to the listings (the map is loaded with the other
@@ -577,58 +630,86 @@ impl Pricing {
     }
 
     pub fn relabel_name(&self, name: &str) -> String {
-        let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.copy_in_ui_lang() {
+            return name.to_string();
+        }
+        let labels = lock(&self.labels);
         let mut out = name.to_string();
         // Longest first so a base inside a unique name is not replaced piecemeal.
         let mut pairs: Vec<(&String, &String)> = labels.iter().collect();
         pairs.sort_by_key(|(en, _)| std::cmp::Reverse(en.len()));
-        for (en, ru) in pairs {
+        for (en, local) in pairs {
             if out.contains(en.as_str()) {
-                out = out.replace(en.as_str(), ru);
+                out = out.replace(en.as_str(), local);
             }
         }
         out
     }
 
-    /// Swap the English texts on a fresh result for the Russian originals. Only the
-    /// display `text` fields change — ids/values that build the query stay English.
-    fn relabel(&self, mut res: PriceResult) -> PriceResult {
-        {
-            let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
-            if labels.is_empty() {
-                return res;
-            }
+    /// Localize a fresh result for the UI: the copy's own wording on the card (when
+    /// the UI speaks its language — only display `text` fields change, ids/values that
+    /// build the query stay English), the trade-site link on the UI language's site,
+    /// and the currency icons.
+    async fn finish(&self, mut res: PriceResult) -> PriceResult {
+        if self.copy_in_ui_lang() {
+            let labels = lock(&self.labels).clone();
             for s in &mut res.parsed_stats {
-                if let Some(ru) = labels.get(&s.text) {
-                    s.text = ru.clone();
+                if let Some(local) = labels.get(&s.text) {
+                    s.text = local.clone();
                 }
             }
             for b in &mut res.base_properties {
-                if let Some(ru) = labels.get(&b.text) {
-                    b.text = ru.clone();
+                if let Some(local) = labels.get(&b.text) {
+                    b.text = local.clone();
                 }
             }
+            res.item = self.relabel_name(&res.item);
         }
-        res.item = self.relabel_name(&res.item);
-        // A Russian client player gets the Russian trade site. Its search ids are the
-        // gzipped query itself, but with Russian base/unique names — an English
-        // `type` makes the ru. site reject the search — so rebuild the id locally.
-        if let Some(q) = res.site_query.as_ref() {
-            let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
-            let mut q = q.clone();
-            for key in ["type", "name"] {
-                if let Some(ru) = q[key].as_str().and_then(|en| labels.get(en)) {
-                    q[key] = serde_json::Value::String(ru.clone());
-                }
-            }
+        self.localize_trade_url(&mut res).await;
+        self.with_icons(res).await
+    }
+
+    /// Point "Open on trade" at the UI language's site. Its search ids are the gzipped
+    /// query itself, and a localized site rejects English base/unique names, so the
+    /// query is rebuilt with that language's names and encoded locally. English and
+    /// Thai (English item names) keep the API's own id.
+    async fn localize_trade_url(&self, res: &mut PriceResult) {
+        let ui = self.ui_lang();
+        let Some(q) = res.site_query.clone() else { return };
+        if ui == Lang::En {
+            return;
+        }
+        let league = urlencoding::encode(&res.league).into_owned();
+        if ui == Lang::Th {
             if let Some(id) = site_search_id(&q) {
-                res.trade_url = Some(format!(
-                    "https://ru.pathofexile.com/trade2/search/poe2/{}/{id}",
-                    urlencoding::encode(&res.league)
-                ));
+                res.trade_url = Some(format!("https://th.pathofexile.com/trade2/search/poe2/{league}/{id}"));
+            }
+            return;
+        }
+        // The dictionary gives the exact localized base/unique name; the copy's labels
+        // are only a fallback (for a magic item they map the base to the whole affixed
+        // name line, which the site would not accept as a type).
+        let dict = self.lang_dict(ui).await;
+        let labels = self.copy_in_ui_lang().then(|| lock(&self.labels).clone());
+        let mut q = q;
+        for key in ["type", "name"] {
+            let Some(en) = q[key].as_str().map(String::from) else { continue };
+            let local = dict
+                .as_ref()
+                .and_then(|d| d.local_name(&en))
+                .or_else(|| labels.as_ref().and_then(|l| l.get(&en).cloned()));
+            match local {
+                Some(l) => q[key] = serde_json::Value::String(l),
+                // No local name → the localized site would reject it; keep www.
+                None => return,
             }
         }
-        res
+        if let Some(id) = site_search_id(&q) {
+            res.trade_url = Some(format!(
+                "https://{}.pathofexile.com/trade2/search/poe2/{league}/{id}",
+                ui.host()
+            ));
+        }
     }
 
     /// Override the active league (T5 league selector). `None` reverts to auto
@@ -649,8 +730,7 @@ impl Pricing {
     /// `RateLimited` result the overlay renders as text.
     pub async fn price(&self, item: &ParsedItem) -> PriceResult {
         let res = self.price_inner(item).await;
-        let res = self.relabel(res);
-        self.with_icons(res).await
+        self.finish(res).await
     }
 
     async fn price_inner(&self, item: &ParsedItem) -> PriceResult {
@@ -709,19 +789,19 @@ impl Pricing {
         }
         .unwrap_or_default();
         let mut entries = entries;
-        let mut lang = "en";
-        if self.is_ru() {
-            if let Some(d) = self.ru_dict().await {
-                lang = "ru";
+        let ui = self.ui_lang();
+        // Thai trade data keeps English item names — nothing to translate.
+        if ui != Lang::En && ui != Lang::Th {
+            if let Some(d) = self.lang_dict(ui).await {
                 for e in &mut entries {
-                    if let Some(ru) = d.ru_name(&e.name) {
-                        e.name = ru;
+                    if let Some(local) = d.local_name(&e.name) {
+                        e.name = local;
                     }
                 }
             }
         }
         PriceSheet {
-            lang: lang.to_string(),
+            lang: ui.code().to_string(),
             league: snapshot.league,
             category: label.to_string(),
             groups: ninja::SHEET_GROUPS
@@ -746,8 +826,7 @@ impl Pricing {
         base_properties: Vec<BaseProp>,
     ) -> PriceResult {
         let res = self.requery_inner(league, parsed_stats, base_properties).await;
-        let res = self.relabel(res);
-        self.with_icons(res).await
+        self.finish(res).await
     }
 
     async fn requery_inner(
@@ -952,22 +1031,42 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<serde_json::V
     resp.json().await.ok()
 }
 
-/// Fetch the `www.` + `ru.` trade2 reference data and build the translation tables.
-async fn fetch_ru_dict(client: &reqwest::Client) -> Option<i18n::RuDict> {
-    let get = |host: &str, what: &str| {
+/// Fetch the `www.` + `lang`'s trade2 reference data and build the translation tables.
+async fn fetch_lang_dict(client: &reqwest::Client, lang: Lang) -> Option<i18n::LangDict> {
+    let url = |host: &str, what: &str| {
         format!("https://{host}.pathofexile.com/api/trade2/data/{what}")
     };
-    // Sequential on purpose: once a day, and it keeps the burst on GGG's data API small.
-    let stats_en = fetch_json(client, &get("www", "stats")).await;
-    let stats_ru = fetch_json(client, &get("ru", "stats")).await;
-    let items_en = fetch_json(client, &get("www", "items")).await;
-    let items_ru = fetch_json(client, &get("ru", "items")).await;
-    let static_en = fetch_json(client, &get("www", "static")).await;
-    let static_ru = fetch_json(client, &get("ru", "static")).await;
-    let filters_ru = fetch_json(client, &get("ru", "filters")).await;
-    Some(i18n::RuDict::build(
-        &stats_en?, &stats_ru?, &items_en?, &items_ru?, &static_en?, &static_ru?, &filters_ru?,
+    let host = lang.host();
+    // Sequential on purpose: once a day per language, and it keeps the burst on GGG's
+    // data API small.
+    let stats_en = fetch_json(client, &url("www", "stats")).await;
+    let stats_l = fetch_json(client, &url(host, "stats")).await;
+    let items_en = fetch_json(client, &url("www", "items")).await;
+    let items_l = fetch_json(client, &url(host, "items")).await;
+    let static_en = fetch_json(client, &url("www", "static")).await;
+    let static_l = fetch_json(client, &url(host, "static")).await;
+    let filters_l = fetch_json(client, &url(host, "filters")).await;
+    Some(i18n::LangDict::build(
+        lang, &stats_en?, &stats_l?, &items_en?, &items_l?, &static_en?, &static_l?, &filters_l?,
     ))
+}
+
+/// RePoE (repoe-fork, PoE2 game-data export): English base type → in-game item class
+/// (`"Gold Ring"` → `"Rings"`), released items only.
+async fn fetch_base_classes(client: &reqwest::Client) -> Option<HashMap<String, String>> {
+    let classes = fetch_json(client, "https://repoe-fork.github.io/poe2/item_classes.min.json").await?;
+    let bases = fetch_json(client, "https://repoe-fork.github.io/poe2/base_items.min.json").await?;
+    let map: HashMap<String, String> = bases
+        .as_object()?
+        .values()
+        .filter(|b| b["release_state"].as_str() == Some("released"))
+        .filter_map(|b| {
+            let name = b["name"].as_str()?;
+            let class = classes[b["item_class"].as_str()?]["name"].as_str()?;
+            Some((name.to_string(), class.to_string()))
+        })
+        .collect();
+    (!map.is_empty()).then_some(map)
 }
 
 /// A trade-site search id: the `query` JSON, gzipped, URL-safe base64 without padding

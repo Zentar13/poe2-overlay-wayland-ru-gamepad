@@ -121,15 +121,21 @@ pub fn price_check(app: &AppHandle) {
     };
     eprintln!("[hotkey] price check: {} chars copied", text.len());
 
-    // A Russian game client copies Russian item text; translate it to the English
-    // format the parser and pricers speak (trade::i18n). No-op for English copies.
+    // A localized game client copies item text in its language; translate it to the
+    // English format the parser and pricers speak (trade::i18n). No-op for English
+    // copies, which still update the auto UI language.
     let text = match app.try_state::<trade::Pricing>() {
-        Some(pricing) if trade::is_russian(&text) => {
+        Some(pricing) => {
+            let lang = trade::detect_lang(&text);
             let en = tauri::async_runtime::block_on(pricing.localize(&text));
-            eprintln!("[hotkey] translated Russian copy:\n{en}");
+            if let Some(l) = lang {
+                eprintln!("[hotkey] translated {} copy:\n{en}", l.code());
+            }
+            // The UI language may follow the game (auto) — tell the panel.
+            let _ = app.emit("ui-lang", pricing.ui_lang().code());
             en
         }
-        _ => text,
+        None => text,
     };
 
     // Parse → price (T4). The parser is pure; pricing is async, so we block this
@@ -147,15 +153,14 @@ pub fn price_check(app: &AppHandle) {
     if danger::is_waystone(&parsed) {
         let mut report = danger::analyze(&parsed);
         if let Some(pricing) = app.try_state::<trade::Pricing>() {
-            if pricing.is_ru() {
-                danger::to_russian(&mut report);
-                for f in &mut report.flags {
-                    if !f.matched.is_empty() {
-                        f.matched = pricing.relabel_line(&f.matched);
-                    }
+            danger::localize(&mut report, pricing.ui_lang());
+            // Mod lines / name in the copy's own wording when the UI speaks its language.
+            for f in &mut report.flags {
+                if !f.matched.is_empty() {
+                    f.matched = pricing.relabel_line(&f.matched);
                 }
-                report.item = pricing.relabel_name(&report.item);
             }
+            report.item = pricing.relabel_name(&report.item);
         }
         eprintln!(
             "[hotkey] waystone danger: {:?} ({} flag(s))",
@@ -191,7 +196,7 @@ pub fn price_check(app: &AppHandle) {
 
 /// Whether clipboard text is a PoE2 item copy (English or Russian client).
 fn is_item_copy(text: &str) -> bool {
-    text.contains("Item Class:") || trade::is_russian(text)
+    text.contains("Item Class:") || trade::detect_lang(text).is_some()
 }
 
 /// Map the overlay surface only when hidden. Calling `show()` on an already-mapped

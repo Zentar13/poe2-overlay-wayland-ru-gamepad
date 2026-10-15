@@ -7,6 +7,7 @@
 // changing the league requeries directly since it is a single deliberate action).
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { LANG_NAMES, msg, sheetLabel, t } from "./i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -91,41 +92,32 @@ interface PriceSheet {
   entries: SheetEntry[];
 }
 
-// Russian labels for the two panels whose content the backend localizes (waystone
-// danger, price sheet) — shown when the payload says `lang: "ru"`. Category keys stay
-// English: they are what `get_price_sheet` takes.
-const RU_LABELS: Record<string, string> = {
-  safe: "Безопасно",
-  caution: "Осторожно",
-  dangerous: "Опасно",
-  deadly: "Смертельно",
-  General: "Общее",
-  Gems: "Камни",
-  Equipment: "Снаряжение",
-  Atlas: "Атлас",
-  Runes: "Руны",
-  Currency: "Валюта",
-  Fragments: "Фрагменты",
-  Essences: "Сущности",
-  Omens: "Предсказания",
-  "Soul Cores": "Ядра душ",
-  Abyss: "Бездна",
-  Breach: "Разлом",
-  Delirium: "Делириум",
-  Idols: "Идолы",
-  "Uncut Gems": "Неогранённые камни",
-  "Lineage Gems": "Династические камни",
-  "Unique Weapons": "Уникальное оружие",
-  "Unique Armours": "Уникальные доспехи",
-  "Unique Accessories": "Уникальная бижутерия",
-  "Unique Jewels": "Уникальные самоцветы",
-  "Unique Flasks": "Уникальные флаконы",
-  "Precursor Tablets": "Плитки предтеч",
-  "Unique Tablets": "Уникальные плитки",
-  Expedition: "Экспедиция",
-};
-function tr(lang: string | undefined, key: string): string {
-  return lang === "ru" ? (RU_LABELS[key] ?? key) : key;
+// UI language in effect (settings choice, or auto = the game client's); the backend
+// pushes changes on "ui-lang". Panel payloads also carry their own `lang`.
+const uiLang = ref<string>("en");
+const settingsOpen = ref(false);
+const langSetting = ref<string>("auto");
+
+async function loadSettings() {
+  try {
+    const v = await invoke<{ language: string; effective: string }>("get_settings");
+    langSetting.value = v.language;
+    uiLang.value = v.effective;
+  } catch (e) {
+    console.error("get_settings failed", e);
+  }
+}
+
+async function changeLanguage() {
+  try {
+    const v = await invoke<{ language: string; effective: string }>("set_language", {
+      language: langSetting.value,
+    });
+    langSetting.value = v.language;
+    uiLang.value = v.effective;
+  } catch (e) {
+    console.error("set_language failed", e);
+  }
 }
 
 const itemName = ref("");
@@ -211,10 +203,11 @@ const spread = computed(() => {
   const range = lo === hi ? lo : `${lo} – ${hi}`;
   // The exact search found nothing and the backend loosened it — say how, since the
   // checked filters alone no longer describe what was matched.
-  const relaxed = r.relaxed ? ` · relaxed: ${r.relaxed}` : "";
+  const L = uiLang.value;
+  const relaxed = r.relaxed ? ` · ${t(L, "relaxed", { x: msg(L, r.relaxed) })}` : "";
   return r.total && r.total > r.listings.length
-    ? `${range} · cheapest ${r.listings.length} of ${r.total} matches${relaxed}`
-    : `${range} · ${r.listings.length} matches${relaxed}`;
+    ? `${range} · ${t(L, "cheapestOf", { n: r.listings.length, total: r.total })}${relaxed}`
+    : `${range} · ${t(L, "matches", { n: r.listings.length })}${relaxed}`;
 });
 
 // Sheet-name matching ignores case and apostrophes: poe.ninja ids lose the apostrophe
@@ -334,27 +327,18 @@ async function openTrade() {
 // Human label for a base-property filter so each checkbox says what it matches, not
 // just a bare value (the id is the stable key from the backend's build_base_properties).
 function propKind(id: string): string {
-  switch (id) {
-    case "class":
-      return "Class";
-    case "rarity":
-      return "Rarity";
-    case "base":
-      return "Base type";
-    case "name":
-      return "Name";
-    case "ilvl":
-      return "Item level";
-    case "gemLevel":
-      return "Gem level";
-    case "quality":
-      return "Quality";
-    case "sockets":
-    case "gem_sockets":
-      return "Sockets";
-    default:
-      return "Filter";
-  }
+  const key: Record<string, string> = {
+    class: "kindClass",
+    rarity: "kindRarity",
+    base: "kindBase",
+    name: "kindName",
+    ilvl: "kindIlvl",
+    gemLevel: "kindGemLevel",
+    quality: "kindQuality",
+    sockets: "kindSockets",
+    gem_sockets: "kindSockets",
+  };
+  return t(uiLang.value, key[id] ?? "kindFilter");
 }
 
 function onKey(e: KeyboardEvent) {
@@ -363,6 +347,8 @@ function onKey(e: KeyboardEvent) {
 
 onMounted(async () => {
   window.addEventListener("keydown", onKey);
+  await loadSettings();
+  unlisten.push(await listen<string>("ui-lang", (e) => (uiLang.value = e.payload)));
   // Right stick / D-pad from the backend's gamepad thread (only while the card is up).
   unlisten.push(
     await listen<number>("gamepad-scroll", (e) => {
@@ -371,6 +357,7 @@ onMounted(async () => {
   );
   unlisten.push(
     await listen<string>("price-check-loading", (e) => {
+      settingsOpen.value = false; // a new check takes the card back from settings
       reqGen.value++; // invalidate any in-flight requery for the previous item
       stopCountdown(); // a fresh check owns the card; the result restarts it if limited
       itemName.value = e.payload;
@@ -385,10 +372,14 @@ onMounted(async () => {
     }),
   );
   unlisten.push(
-    await listen<PriceResult>("price-check-result", (e) => applyResult(e.payload)),
+    await listen<PriceResult>("price-check-result", (e) => {
+      settingsOpen.value = false;
+      applyResult(e.payload);
+    }),
   );
   unlisten.push(
     await listen<DangerReport>("price-check-danger", (e) => {
+      settingsOpen.value = false; // a new check takes the card back from settings
       reqGen.value++; // a waystone check also invalidates any in-flight requery
       danger.value = e.payload;
       itemName.value = e.payload.item;
@@ -427,6 +418,7 @@ onMounted(async () => {
   );
   unlisten.push(
     await listen("show-runes", async () => {
+      settingsOpen.value = false;
       reqGen.value++; // opening the price sheet abandons any in-flight requery
       const myGen = reqGen.value;
       busy.value = false;
@@ -460,9 +452,37 @@ onUnmounted(() => {
 <template>
   <div class="overlay-root">
     <div class="card">
-      <button class="close" title="Hide (Ctrl+Alt+X)" @click="hide">✕</button>
+      <button class="close" :title="t(uiLang, 'hide')" @click="hide">✕</button>
+      <button
+        class="close gear"
+        :class="{ active: settingsOpen }"
+        :title="t(uiLang, 'settings')"
+        @click="settingsOpen = !settingsOpen"
+      >
+        ⚙
+      </button>
 
-      <template v-if="cheatsheet">
+      <template v-if="settingsOpen">
+        <header class="head">
+          <div class="name">{{ t(uiLang, "settings") }}</div>
+        </header>
+        <label class="setting">
+          <span class="field-label">{{ t(uiLang, "language") }}</span>
+          <div class="select-wrap">
+            <select v-model="langSetting" class="league" @change="changeLanguage">
+              <option value="auto">{{ t(uiLang, "langAuto") }}</option>
+              <option v-for="(name, code) in LANG_NAMES" :key="code" :value="code">{{ name }}</option>
+            </select>
+          </div>
+        </label>
+        <div class="status">{{ t(uiLang, "langAutoHint") }}</div>
+        <div class="actions">
+          <button class="requery" @click="settingsOpen = false">{{ t(uiLang, "close") }}</button>
+        </div>
+      </template>
+
+
+      <template v-else-if="cheatsheet">
         <header class="head">
           <div class="name">Regex cheat-sheet</div>
         </header>
@@ -489,11 +509,11 @@ onUnmounted(() => {
 
       <template v-else-if="priceSheet">
         <header class="head">
-          <div class="name">{{ tr(priceSheet.lang, priceSheet.category) }}</div>
+          <div class="name">{{ sheetLabel(priceSheet.lang, priceSheet.category) }}</div>
           <div class="sheet-league">
             {{ priceSheet.league }} · poe.ninja ·
             <button class="sheet-toggle" @click="catsOpen = !catsOpen">
-              {{ (catsOpen ? "▾ " : "▸ ") + (priceSheet.lang === "ru" ? "категории" : "categories") }}
+              {{ (catsOpen ? "▾ " : "▸ ") + t(priceSheet.lang, "categories") }}
             </button>
           </div>
         </header>
@@ -507,7 +527,7 @@ onUnmounted(() => {
               :disabled="sheetBusy"
               @click="switchGroup(g)"
             >
-              {{ tr(priceSheet.lang, g.name) }}
+              {{ sheetLabel(priceSheet.lang, g.name) }}
             </button>
           </div>
           <div class="sheet-cats">
@@ -519,7 +539,7 @@ onUnmounted(() => {
               :disabled="sheetBusy"
               @click="switchCategory(c)"
             >
-              {{ tr(priceSheet.lang, c) }}
+              {{ sheetLabel(priceSheet.lang, c) }}
             </button>
           </div>
         </template>
@@ -527,7 +547,7 @@ onUnmounted(() => {
           v-model="sheetFilter"
           class="sheet-filter"
           type="text"
-          :placeholder="priceSheet.lang === 'ru' ? 'Фильтр по названию…' : 'Filter by name… (e.g. craiceann)'"
+          :placeholder="t(priceSheet.lang, 'sheetFilter')"
         />
         <ul v-if="filteredEntries.length" class="listings" :class="{ stale: sheetBusy }">
           <li v-for="e in filteredEntries" :key="e.name" class="listing">
@@ -536,14 +556,10 @@ onUnmounted(() => {
           </li>
         </ul>
         <div v-else-if="priceSheet.entries.length" class="status">
-          {{ priceSheet.lang === "ru" ? "Ничего не найдено." : "Nothing matches the filter." }}
+          {{ t(priceSheet.lang, "sheetNothing") }}
         </div>
         <div v-else class="status err">
-          {{
-            priceSheet.lang === "ru"
-              ? "poe.ninja недоступен — выберите другую категорию или нажмите Ctrl+Alt+F ещё раз."
-              : "poe.ninja unreachable — pick another category or press Ctrl+Alt+F to retry."
-          }}
+          {{ t(priceSheet.lang, "sheetUnreachable") }}
         </div>
       </template>
 
@@ -552,10 +568,10 @@ onUnmounted(() => {
           <div class="name">PoE2 Overlay</div>
         </header>
         <div class="hint">
-          <div class="hint-row"><kbd>Ctrl+Alt+D</kbd><span>price-check the hovered item</span></div>
-          <div class="hint-row"><kbd>Ctrl+Alt+F</kbd><span>open the price sheet</span></div>
-          <div class="hint-row"><kbd>Ctrl+Alt+X</kbd><span>hide the overlay</span></div>
-          <div class="hint-row"><kbd>R-stick / B</kbd><span>scroll / close (gamepad)</span></div>
+          <div class="hint-row"><kbd>Ctrl+Alt+D</kbd><span>{{ t(uiLang, "hintPrice") }}</span></div>
+          <div class="hint-row"><kbd>Ctrl+Alt+F</kbd><span>{{ t(uiLang, "hintSheet") }}</span></div>
+          <div class="hint-row"><kbd>Ctrl+Alt+X</kbd><span>{{ t(uiLang, "hintHide") }}</span></div>
+          <div class="hint-row"><kbd>R-stick / B</kbd><span>{{ t(uiLang, "hintPad") }}</span></div>
         </div>
       </template>
 
@@ -565,7 +581,7 @@ onUnmounted(() => {
             <div>{{ nameParts[0] }}</div>
             <div v-if="nameParts[1]" class="name-base">{{ nameParts[1] }}</div>
           </div>
-          <span class="level" :class="danger.level">{{ tr(danger.lang, danger.level) }}</span>
+          <span class="level" :class="danger.level">{{ t(danger.lang, danger.level) }}</span>
         </header>
         <ul v-if="danger.flags.length" class="flags">
           <li v-for="(f, i) in danger.flags" :key="i" class="flag" :class="f.severity">
@@ -578,18 +594,18 @@ onUnmounted(() => {
           </li>
         </ul>
         <div v-else class="status safe">
-          {{ danger.lang === "ru" ? "Опасных свойств нет — можно проходить." : "No dangerous mods — safe to run." }}
+          {{ t(danger.lang, "dangerNone") }}
         </div>
       </template>
 
       <template v-else>
         <header class="head">
           <div class="name" :class="rarityClass">
-            <div>{{ nameParts[0] || "Unrecognized item" }}</div>
+            <div>{{ nameParts[0] || t(uiLang, "unrecognized") }}</div>
             <div v-if="nameParts[1]" class="name-base">{{ nameParts[1] }}</div>
           </div>
           <label v-if="leagues.length" class="league-field">
-            <span class="field-label">League</span>
+            <span class="field-label">{{ t(uiLang, "league") }}</span>
             <div class="select-wrap">
               <select v-model="selectedLeague" class="league" :disabled="busy || rateWait > 0" @change="requery">
                 <option v-for="lg in leagues" :key="lg" :value="lg">{{ lg }}</option>
@@ -600,14 +616,14 @@ onUnmounted(() => {
 
         <section v-if="hasFilters" class="filters">
           <div class="filters-head">
-            <span class="filters-title">Search filters</span>
-            <span class="filters-hint">Tick the item properties to match in the trade search</span>
+            <span class="filters-title">{{ t(uiLang, "filters") }}</span>
+            <span class="filters-hint">{{ t(uiLang, "filtersHint") }}</span>
           </div>
 
           <label v-for="bp in baseProps" :key="bp.id" class="row">
             <input v-model="bp.active" type="checkbox" :disabled="busy" />
             <span class="fkind">{{ propKind(bp.id) }}</span>
-            <span class="ftext">{{ bp.text }}</span>
+            <span class="ftext">{{ msg(uiLang, bp.text) }}</span>
           </label>
 
           <div v-for="(st, i) in stats" :key="st.id + i" class="row stat">
@@ -619,20 +635,26 @@ onUnmounted(() => {
 
           <div class="actions">
             <button class="requery" :disabled="busy || rateWait > 0" @click="requery">
-              {{ busy ? "Searching…" : rateWait > 0 ? `Wait ${rateWait}s…` : "Search again" }}
+              {{
+                busy
+                  ? t(uiLang, "searching")
+                  : rateWait > 0
+                    ? t(uiLang, "wait", { n: rateWait })
+                    : t(uiLang, "searchAgain")
+              }}
             </button>
             <button
               class="requery"
               :disabled="busy || !result?.tradeUrl"
-              title="Open this search on the trade site"
+              :title="t(uiLang, 'openTradeHint')"
               @click="openTrade"
             >
-              Open on trade
+              {{ t(uiLang, "openTrade") }}
             </button>
           </div>
         </section>
 
-        <div v-if="loading" class="status searching">Searching market…</div>
+        <div v-if="loading" class="status searching">{{ t(uiLang, "searchingMarket") }}</div>
 
         <template v-else-if="result">
           <div v-if="spread" class="spread" :class="{ stale: busy }">{{ spread }}</div>
@@ -652,13 +674,9 @@ onUnmounted(() => {
           </ul>
           <div v-else class="status" :class="{ err: result.status === 'error' }">
             <template v-if="result.status === 'rateLimited'">
-              {{
-                rateWait > 0
-                  ? `Rate limit — try again in ${rateWait}s`
-                  : "Rate limit cleared — you can search again."
-              }}
+              {{ rateWait > 0 ? t(uiLang, "rateWait", { n: rateWait }) : t(uiLang, "rateCleared") }}
             </template>
-            <template v-else>{{ result.message || "No listings" }}</template>
+            <template v-else>{{ msg(uiLang, result.message) || t(uiLang, "noListings") }}</template>
           </div>
         </template>
       </template>
@@ -745,6 +763,21 @@ body,
 }
 .card::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* Settings toggle, left of ✕. */
+.close.gear {
+  right: 43px;
+  font-size: 15px;
+}
+.close.gear.active {
+  border-color: var(--edge-hi);
+  color: #f4e7c3;
+}
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .close {
