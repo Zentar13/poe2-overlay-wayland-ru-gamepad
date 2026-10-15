@@ -27,9 +27,10 @@ HIDE_KEY="${POE2_HIDE_KEY:-Ctrl+Alt+X}"
 RUNES_KEY="${POE2_RUNES_KEY:-Ctrl+Alt+F}"
 # main.rs sets these in-process too; the launcher exports them as belt-and-suspenders
 # so the GTK/WebKit backend is correct however the process is started (see ADR-0001).
-# DMA-BUF renderer ON (=0): with it off, WebKit commits partial frames on AMD/KWin and
-# the card shows only repainted regions until the overlay gets focus.
-WAYLAND_ENV="env GDK_BACKEND=wayland WEBKIT_DISABLE_DMABUF_RENDERER=0"
+# DMA-BUF stays off by default (upstream: it crashed WebKitGTK there). On AMD/KWin it
+# may be needed the other way round — with it off the card can show only repainted
+# regions until it gets focus; then install with POE2_DMABUF=1 (see README).
+WAYLAND_ENV="env GDK_BACKEND=wayland WEBKIT_DISABLE_DMABUF_RENDERER=$([[ ${POE2_DMABUF:-0} == 1 ]] && echo 0 || echo 1)"
 
 mkdir -p "$BIN_DIR" "$APP_DIR" "$AUTOSTART_DIR" "$ICON_DIR"
 

@@ -1,87 +1,103 @@
-# PoE2 Overlay
+# PoE2 Overlay — Wayland, русский клиент, геймпад
 
-A Wayland-native **Path of Exile 2 trade overlay** for **KDE Plasma** (Tauri 2 +
-Rust + Vue). It draws over a fullscreen Proton game via `wlr-layer-shell`, copies
-the hovered item, and prices it against the GGG trade2 API + poe.ninja — the same
-job the Windows-only Overwolf "PoE Overlay II" does, but built for native KWin
-Wayland where the X11-based overlays (Exiled-Exchange-2, awakened-poe-trade) fail.
+Оверлей цен для **Path of Exile 2** под **KDE Plasma 6 / KWin Wayland**: рисуется поверх
+полноэкранной игры (Steam Proton) через `wlr-layer-shell`, копирует предмет под курсором
+и оценивает его по официальному trade2 API GGG и poe.ninja.
 
-> Status: **working — all features user-verified in-game** (T1–T11, plan archived at
-> `docs/plans/archive/0001-mvp-price-check-overlay.md`). The overlay wears PoE2's own
-> tooltip look (Fontin, bronze/gold, rarity colors — see `DESIGN.md` and
-> `docs/theme-preview.png`) with on-demand keyboard focus for the typed filters
-> (ADR-0007).
+Это форк [andre-lund/poe2-overlay](https://github.com/andre-lund/poe2-overlay) с
+поддержкой локализованных клиентов игры (в первую очередь русского), управлением с
+геймпада и рядом доработок поиска. Описание оригинала — в [README.en.md](README.en.md).
 
-## What it does
+![Карточка «Охотника за головами» в русском клиенте](docs/screenshot-ru.png)
 
-Three hotkeys, all forwarded to one warm background instance (KDE global shortcuts):
+## Чем отличается от оригинала
 
-- **`Ctrl+Alt+D` — price check.** Hover an item, press the key: the overlay copies it,
-  parses the item text, and prices it — gear via a GGG trade2 search+fetch (per-stat
-  filter toggles, editable min/max, league selector, explicit requery), currency and
-  bulk via poe.ninja (zero GGG quota). Self-throttles against GGG's `X-Rate-Limit`
-  headers so a mashed hotkey can't get you IP-banned.
-- **`Ctrl+Alt+D` over a Waystone — danger check.** A waystone yields a danger verdict
-  instead of a price: a Safe/Caution/Dangerous/Deadly rating with the specific map mods
-  that earned it, from a keyword ruleset grounded in the live PoE2 mod surface. Local,
-  instant, no GGG quota.
-- **`Ctrl+Alt+F` — price sheet.** A browsable poe.ninja catalogue for the reward panels
-  the game won't let you copy from (runes, uncut/lineage gems, currency, fragments,
-  essences, uniques, tablets…), grouped under General / Equipment / Atlas tabs with a
-  client-side filter. One round-trip per category switch.
-- **`Ctrl+Alt+X` — panic hide.** Guaranteed compositor-level escape that dismisses the
-  overlay (also `✕` / `Esc`).
+**Языки**
+- Работает с копиями предметов из клиентов на **русском, немецком, французском,
+  испанском, португальском, японском и корейском** (тайский клиент копирует по-английски).
+  Язык определяется автоматически; копия переводится в английский формат перед оценкой
+  по справочникам trade2 самой GGG, так что поиск идёт по тем же id, что и на сайте.
+- **Язык интерфейса** выбирается в настройках (⚙): «Авто» — как в игре, или любой из
+  девяти языков trade2. Переведены карточка, сообщения, таблица цен (названия предметов и
+  категорий) и оценка опасности путевых камней.
+- Если язык интерфейса совпадает с языком игры, моды, класс и база в карточке показываются
+  так, как написаны в игре.
 
-A regex stash/vendor cheat-sheet (clipboard-write) is built but **dormant** — its
-`Ctrl+Alt+F` slot now serves the price sheet; see ADR-0006.
+**Геймпад** (пока карточка открыта, ввод с геймпада в игру не уходит)
+- Правый стик — прокрутка, крестовина вверх/вниз — прокрутка шагами.
+- Левый стик — выбор строки фильтра, **X** или **A** — снять/поставить галочку или нажать
+  «Искать снова». **B** — закрыть.
+- Работает и со Steam Input (виртуальный геймпад Steam блокируется, физический читается).
 
-## Why this exists / how it works
+**Поиск и карточка**
+- **Ослабление пустого поиска.** Если точный поиск ничего не нашёл, оверлей по очереди
+  снимает моды рун и зачарований, затем ищет «любые N−1 из N модов», затем «N−2 из N».
+  В карточке видно, какое ослабление сработало.
+- **Иконки валют** как в игре: `945× [иконка]` с пересчётом в Exalted.
+- Кнопка **«Открыть на trade»** — тот же поиск на сайте, на домене языка интерфейса.
+- **Лига** выбирается в настройках («Авто» — текущая лига сезона) и запоминается.
+- Кнопки ✕ и ⚙ закреплены и не уезжают при прокрутке.
 
-See `docs/adr/` for the decisions (ADR-0001 the clean build + layer-shell mechanism,
-0002 the KDE-shortcut input path, 0003 overlay dismissal safety, 0004 the pricing core
-+ event contract, 0005 the waystone danger check, 0006 the regex cheat-sheet) and
-`docs/research/RESEARCH.md` for the landscape study (why X11 overlays break on Wayland,
-the candidate matrix). `CONTEXT.md` is the glossary; the validated reference,
-**PathofTrading**, is studied in `docs/research/`.
+**Исправления**
+- Предмет, который персонаж не может надеть («Вы не можете использовать этот предмет…»),
+  раньше ломал поиск — строка-предупреждение принималась за имя предмета.
 
-Target stack: CachyOS / KDE Plasma 6 / KWin Wayland, PoE2 via Steam Proton.
+Исправление и локализация предложены автору оригинала:
+[#2](https://github.com/andre-lund/poe2-overlay/pull/2),
+[#1](https://github.com/andre-lund/poe2-overlay/pull/1).
 
-## Build prerequisites (Arch/CachyOS)
+## Управление
 
-```bash
-sudo pacman -S --needed webkit2gtk-4.1 gtk3 gtk-layer-shell base-devel
-# Rust + Node also required; the in-game copy needs /dev/uinput access
-# (session ACL or the `input` group).
-```
+| Клавиши | Действие |
+|---|---|
+| `Ctrl+Alt+D` | Цена предмета под курсором (над путевым камнем — оценка опасности) |
+| `Ctrl+Alt+F` | Таблица цен poe.ninja (руны, валюта, сущности, уники…) |
+| `Ctrl+Alt+X`, `✕`, `Esc` | Скрыть оверлей |
+| ⚙ на карточке | Язык интерфейса и лига |
 
-## Install (KDE Plasma 6 Wayland)
+Проверку цены можно вызвать и командой `poe2-overlay --price-check` — например, из своего
+скрипта или с кнопки геймпада.
 
-```bash
-npm install            # first time
-npm run tauri:build    # -> AppImage/deb/rpm under src-tauri/target/release/bundle/
-./packaging/install.sh # binary + KDE shortcuts (Ctrl+Alt+D / Ctrl+Alt+X / Ctrl+Alt+F) + autostart
-```
-
-Then log out and back in (so KWin registers the shortcuts and the overlay autostarts
-warm). Full runbook — uinput access, key customization, troubleshooting, uninstall —
-in **`docs/INSTALL.md`**.
-
-## Develop
+## Установка (CachyOS / Arch, KDE Plasma 6 Wayland)
 
 ```bash
+sudo pacman -S --needed webkit2gtk-4.1 gtk3 gtk-layer-shell base-devel rustup nodejs npm \
+    wl-clipboard ydotool
+rustup default stable
+systemctl --user enable --now ydotool   # без демона ydotool Ctrl+C в игру не доходит
+
 npm install
-npm run tauri:dev   # or: npm run tauri dev
+npx tauri build --no-bundle   # только бинарник; полный npm run tauri:build ещё и пакует AppImage/deb/rpm
+./packaging/install.sh        # бинарник + горячие клавиши KDE + автозапуск
 ```
 
-## License & attribution
+После установки перелогиньтесь, чтобы KDE подхватил горячие клавиши.
 
-**GPL-3.0-or-later** (see `LICENSE`). The pricing core reimplements techniques from
-[PathofTrading](https://github.com/brendancohan/PathofTrading) by brendancohan
-(GPLv3) — studied as the validated reference on this exact stack and translated to
-Rust, so this project carries the GPL lineage forward. The reference itself is
-vendored unmodified (license and headers intact) under `eval-pathoftrading/` for
-provenance. ExileWatch and other overlays were studied as *behavioral* references
-only (see ADR-0001); no code from them is included.
+Нужен доступ к `/dev/uinput` (обычно уже есть через ACL сессии; иначе — правило
+`packaging/99-poe2-overlay-uinput.rules`). Геймпад читается из `/dev/input/event*` — для
+геймпадов systemd обычно выдаёт доступ сам.
 
-Not affiliated with Grinding Gear Games. The overlay uses the public trade2 API and
-poe.ninja, and self-throttles against GGG's `X-Rate-Limit` headers (ADR-0004).
+Подробнее (права, смена клавиш, удаление) — в [docs/INSTALL.md](docs/INSTALL.md) (англ.).
+
+## Если что-то не так
+
+- **Карточка рисуется кусками или пропадает, пока на неё не навести мышь** (замечено на
+  AMD): включите DMA-BUF-рендерер WebKit — переустановите с `POE2_DMABUF=1 ./packaging/install.sh`
+  или запускайте с `WEBKIT_DISABLE_DMABUF_RENDERER=0`. У автора оригинала WebKit с ним
+  падал, поэтому по умолчанию он выключен.
+- **«Нет предмета» при наведённом курсоре** — проверьте, что запущен `ydotool`
+  (`systemctl --user status ydotool`) и установлен `wl-clipboard`.
+- `PROTON_ENABLE_WAYLAND=1` в параметрах запуска игры оверлею не мешает (и может убрать
+  микрофризы).
+- Лог: `journalctl --user` (или вывод `poe2-overlay` в терминале).
+
+## Лицензия
+
+**GPL-3.0-or-later** (см. `LICENSE`), как и у оригинала. Ядро оценки основано на
+[PathofTrading](https://github.com/brendancohan/PathofTrading) (GPLv3), подробности — в
+[README.en.md](README.en.md). Строки интерфейса игры для разных языков взяты из
+[Exiled-Exchange-2](https://github.com/Kvan7/Exiled-Exchange-2) (MIT), соответствие баз и
+классов — из [RePoE](https://github.com/repoe-fork/repoe).
+
+Не связан с Grinding Gear Games. Используется публичный trade2 API и poe.ninja; запросы к
+GGG сами притормаживают по заголовкам `X-Rate-Limit`.
