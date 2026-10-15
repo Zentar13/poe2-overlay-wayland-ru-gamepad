@@ -1,5 +1,6 @@
 //! Gamepad control of the overlay card: right stick scrolls, D-pad up/down pages,
-//! B closes.
+//! left stick moves a selection over the search filters and X or A presses it (toggles the
+//! filter / runs "Search again"), B closes.
 //!
 //! A controller player has no free hand for the mouse, so while the card is visible
 //! the overlay drives it from the pad and keeps that input away from the game (B would
@@ -40,6 +41,11 @@ const DEADZONE: f64 = 0.2;
 const STICK_PX: f64 = 25.0;
 /// One D-pad step, px.
 const DPAD_PX: f64 = 120.0;
+/// Left-stick deflection that counts as "up"/"down" for the filter selection.
+const NAV_THRESHOLD: f64 = 0.5;
+/// Held stick: first repeat after this, then every `NAV_REPEAT` (key-repeat feel).
+const NAV_DELAY: Duration = Duration::from_millis(400);
+const NAV_REPEAT: Duration = Duration::from_millis(120);
 
 /// Start the gamepad thread.
 pub fn spawn(app: AppHandle) {
@@ -71,6 +77,11 @@ struct State {
     grabbed: bool,
     /// Right stick Y, normalized to -1.0 (up) … 1.0 (down).
     ry: f64,
+    /// Left stick Y, same scale.
+    ly: f64,
+    /// Direction the left stick is held in (-1 / 0 / 1) and when it next repeats.
+    nav_dir: i32,
+    nav_next: Option<Instant>,
     /// Input buttons pressed while grabbed and not yet released.
     held: HashSet<u16>,
 }
@@ -126,6 +137,7 @@ impl State {
         }
 
         let mut close = false;
+        let mut select = false;
         let mut step = 0.0;
         let mut lost = false;
         if let Some(p) = self.input.as_mut() {
@@ -137,6 +149,10 @@ impl State {
                             InputEventKind::AbsAxis(AbsoluteAxisType::ABS_RY) => {
                                 self.ry = normalize(ev.value(), ry_min, ry_max);
                             }
+                            // Both sticks share the axis range on these pads.
+                            InputEventKind::AbsAxis(AbsoluteAxisType::ABS_Y) => {
+                                self.ly = normalize(ev.value(), ry_min, ry_max);
+                            }
                             InputEventKind::AbsAxis(AbsoluteAxisType::ABS_HAT0Y) if self.grabbed => {
                                 step += ev.value() as f64 * DPAD_PX;
                             }
@@ -145,6 +161,12 @@ impl State {
                                     self.held.insert(k.code());
                                     if k == Key::BTN_EAST || (share_closes && k == Key::KEY_RECORD) {
                                         close = true;
+                                    }
+                                    // X or A presses the selection. xpad reports the physical X
+                                    // button as BTN_X (0x133), which the evdev crate only names by
+                                    // its alias BTN_NORTH; A is BTN_SOUTH.
+                                    if k == Key::BTN_NORTH || k == Key::BTN_SOUTH {
+                                        select = true;
                                     }
                                 } else if ev.value() == 0 {
                                     self.held.remove(&k.code());
@@ -164,6 +186,7 @@ impl State {
         if lost {
             self.input = None;
             self.ry = 0.0;
+            self.ly = 0.0;
         }
 
         if close && visible {
@@ -197,7 +220,41 @@ impl State {
             if step != 0.0 {
                 let _ = win.emit("gamepad-scroll", step);
             }
+            if let Some(dir) = self.nav_step() {
+                let _ = win.emit("gamepad-nav", dir);
+            }
+            if select {
+                let _ = win.emit("gamepad-select", ());
+            }
+        } else {
+            self.nav_dir = 0;
         }
+    }
+
+    /// Left stick → one selection step per push, auto-repeating while held.
+    fn nav_step(&mut self) -> Option<i32> {
+        let dir = if self.ly > NAV_THRESHOLD {
+            1
+        } else if self.ly < -NAV_THRESHOLD {
+            -1
+        } else {
+            0
+        };
+        let now = Instant::now();
+        if dir == 0 {
+            self.nav_dir = 0;
+            return None;
+        }
+        if dir != self.nav_dir {
+            self.nav_dir = dir;
+            self.nav_next = Some(now + NAV_DELAY);
+            return Some(dir);
+        }
+        if self.nav_next.is_some_and(|t| now >= t) {
+            self.nav_next = Some(now + NAV_REPEAT);
+            return Some(dir);
+        }
+        None
     }
 }
 

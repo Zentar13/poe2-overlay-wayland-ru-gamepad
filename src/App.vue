@@ -5,7 +5,7 @@
 // The user can toggle base-property / stat filters and pick a league, then Requery
 // (an explicit button — auto-requery on every keystroke would risk the GGG IP limit;
 // changing the league requeries directly since it is a single deliberate action).
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { LANG_NAMES, msg, sheetLabel, t } from "./i18n";
 import { invoke } from "@tauri-apps/api/core";
@@ -169,6 +169,32 @@ function startCountdown(secs: number) {
 
 const hasFilters = computed(() => stats.value.length > 0 || baseProps.value.length > 0);
 
+// Gamepad selection over the filter rows (left stick moves it, X or A presses it): base
+// properties, then stat rows, then the "Search again" button. -1 = nothing selected.
+const padFocus = ref(-1);
+
+function padMove(dir: number) {
+  if (!hasFilters.value || settingsOpen.value) return;
+  const last = baseProps.value.length + stats.value.length; // index of the button
+  padFocus.value =
+    padFocus.value < 0 ? (dir > 0 ? 0 : last) : Math.min(last, Math.max(0, padFocus.value + dir));
+  void nextTick(() => document.querySelector(".pad-focus")?.scrollIntoView({ block: "nearest" }));
+}
+
+function padSelect() {
+  const i = padFocus.value;
+  if (i < 0 || !hasFilters.value || settingsOpen.value || busy.value) return;
+  const nb = baseProps.value.length;
+  const ns = stats.value.length;
+  if (i < nb) {
+    baseProps.value[i].active = !baseProps.value[i].active;
+  } else if (i < nb + ns) {
+    stats.value[i - nb].active = !stats.value[i - nb].active;
+  } else if (rateWait.value <= 0) {
+    void requery();
+  }
+}
+
 // Rarity class for the item-name header, PoE2 tooltip colors (rare yellow, unique
 // orange, …). Derived from the echoed base properties; bulk results carry none and
 // fall back to the default gold.
@@ -257,6 +283,7 @@ async function switchCategory(category: string) {
 }
 
 function applyResult(r: PriceResult) {
+  padFocus.value = -1;
   danger.value = null; // a price result replaces any prior waystone danger panel
   cheatsheet.value = null;
   priceSheet.value = null;
@@ -355,6 +382,8 @@ onMounted(async () => {
       document.querySelector(".card")?.scrollBy({ top: e.payload });
     }),
   );
+  unlisten.push(await listen<number>("gamepad-nav", (e) => padMove(e.payload)));
+  unlisten.push(await listen("gamepad-select", () => padSelect()));
   unlisten.push(
     await listen<string>("price-check-loading", (e) => {
       settingsOpen.value = false; // a new check takes the card back from settings
@@ -368,6 +397,7 @@ onMounted(async () => {
       stats.value = [];
       baseProps.value = [];
       loading.value = true;
+      padFocus.value = -1;
       busy.value = false; // a new check abandons any in-flight requery
     }),
   );
@@ -572,6 +602,7 @@ onUnmounted(() => {
           <div class="hint-row"><kbd>Ctrl+Alt+F</kbd><span>{{ t(uiLang, "hintSheet") }}</span></div>
           <div class="hint-row"><kbd>Ctrl+Alt+X</kbd><span>{{ t(uiLang, "hintHide") }}</span></div>
           <div class="hint-row"><kbd>R-stick / B</kbd><span>{{ t(uiLang, "hintPad") }}</span></div>
+          <div class="hint-row"><kbd>L-stick / X·A</kbd><span>{{ t(uiLang, "hintPadFilters") }}</span></div>
         </div>
       </template>
 
@@ -620,13 +651,18 @@ onUnmounted(() => {
             <span class="filters-hint">{{ t(uiLang, "filtersHint") }}</span>
           </div>
 
-          <label v-for="bp in baseProps" :key="bp.id" class="row">
+          <label v-for="(bp, i) in baseProps" :key="bp.id" class="row" :class="{ 'pad-focus': padFocus === i }">
             <input v-model="bp.active" type="checkbox" :disabled="busy" />
             <span class="fkind">{{ propKind(bp.id) }}</span>
             <span class="ftext">{{ msg(uiLang, bp.text) }}</span>
           </label>
 
-          <div v-for="(st, i) in stats" :key="st.id + i" class="row stat">
+          <div
+            v-for="(st, i) in stats"
+            :key="st.id + i"
+            class="row stat"
+            :class="{ 'pad-focus': padFocus === baseProps.length + i }"
+          >
             <input v-model="st.active" type="checkbox" :disabled="busy" />
             <span class="ftext">{{ st.text }}</span>
             <input v-model="st.min" class="num" placeholder="min" :disabled="busy || !st.active" />
@@ -634,7 +670,12 @@ onUnmounted(() => {
           </div>
 
           <div class="actions">
-            <button class="requery" :disabled="busy || rateWait > 0" @click="requery">
+            <button
+              class="requery"
+              :class="{ 'pad-focus': padFocus === baseProps.length + stats.length }"
+              :disabled="busy || rateWait > 0"
+              @click="requery"
+            >
               {{
                 busy
                   ? t(uiLang, "searching")
@@ -763,6 +804,13 @@ body,
 }
 .card::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* Gamepad selection (left stick + X): a gold outline the eye finds from across the room. */
+.pad-focus {
+  outline: 2px solid var(--gold-bright);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 
 /* Settings toggle, left of ✕. */
