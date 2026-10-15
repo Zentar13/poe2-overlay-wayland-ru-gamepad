@@ -13,6 +13,9 @@ pub struct Settings {
     /// UI language code (`"ru"`, `"de"`, …); `None`/`"auto"` = follow the game client.
     #[serde(default)]
     pub language: Option<String>,
+    /// Trade league to price in; `None`/`"auto"` = the current challenge league.
+    #[serde(default)]
+    pub league: Option<String>,
 }
 
 impl Settings {
@@ -20,6 +23,22 @@ impl Settings {
     pub fn lang(&self) -> Option<Lang> {
         self.language.as_deref().and_then(Lang::from_code)
     }
+
+    /// The chosen league, `None` = auto.
+    pub fn league(&self) -> Option<String> {
+        self.league.clone().filter(|l| l != "auto" && !l.is_empty())
+    }
+}
+
+/// The league part of the settings panel.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeagueView {
+    /// `"auto"` or a league name.
+    pub league: String,
+    /// The league actually priced in.
+    pub effective: String,
+    /// Current leagues to choose from.
+    pub leagues: Vec<String>,
 }
 
 /// What the settings panel shows: the choice and the language actually in effect.

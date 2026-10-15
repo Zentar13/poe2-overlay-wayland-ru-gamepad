@@ -33,7 +33,7 @@ fn hide_overlay(window: WebviewWindow) {
 #[tauri::command]
 async fn requery(
     pricing: State<'_, trade::Pricing>,
-    league: String,
+    league: Option<String>,
     parsed_stats: Vec<trade::ParsedStat>,
     base_properties: Vec<trade::BaseProp>,
 ) -> Result<trade::PriceResult, ()> {
@@ -80,14 +80,44 @@ fn set_language(
 ) -> settings::SettingsView {
     let lang = trade::Lang::from_code(&language);
     pricing.set_ui_setting(lang);
-    let saved = settings::Settings {
-        language: Some(lang.map_or("auto", |l| l.code()).to_string()),
-    };
+    let mut saved = settings::load(&app);
+    saved.language = Some(lang.map_or("auto", |l| l.code()).to_string());
     if let Err(e) = settings::save(&app, &saved) {
         eprintln!("[settings] save failed: {e}");
     }
     let _ = app.emit("ui-lang", pricing.ui_lang().code());
     settings_view(&pricing)
+}
+
+/// Leagues for the settings panel.
+#[tauri::command]
+async fn get_leagues(pricing: State<'_, trade::Pricing>) -> Result<settings::LeagueView, ()> {
+    Ok(league_view(&pricing).await)
+}
+
+/// Choose the league (`"auto"` or a name) for every following check, and persist it.
+#[tauri::command]
+async fn set_league(
+    app: tauri::AppHandle,
+    pricing: State<'_, trade::Pricing>,
+    league: String,
+) -> Result<settings::LeagueView, ()> {
+    let mut saved = settings::load(&app);
+    saved.league = Some(league);
+    pricing.set_league(saved.league());
+    if let Err(e) = settings::save(&app, &saved) {
+        eprintln!("[settings] save failed: {e}");
+    }
+    Ok(league_view(&pricing).await)
+}
+
+async fn league_view(pricing: &trade::Pricing) -> settings::LeagueView {
+    let (leagues, effective) = pricing.leagues().await;
+    settings::LeagueView {
+        league: pricing.league_setting().unwrap_or_else(|| "auto".to_string()),
+        effective,
+        leagues,
+    }
 }
 
 fn settings_view(pricing: &trade::Pricing) -> settings::SettingsView {
@@ -141,7 +171,9 @@ pub fn run() {
             get_price_sheet,
             copy_to_clipboard,
             get_settings,
-            set_language
+            set_language,
+            get_leagues,
+            set_league
         ])
         .setup(|app| {
             let window = app
@@ -160,7 +192,9 @@ pub fn run() {
             }
             // Warm pricing client + caches kept in state across checks (T4, ADR-0004).
             let pricing = trade::Pricing::new();
-            pricing.set_ui_setting(settings::load(app.handle()).lang());
+            let saved = settings::load(app.handle());
+            pricing.set_ui_setting(saved.lang());
+            pricing.set_league(saved.league());
             app.manage(pricing);
             // Controller players: right stick scrolls / B closes the visible card.
             #[cfg(target_os = "linux")]

@@ -108,6 +108,11 @@ async function loadSettings() {
   }
 }
 
+function toggleSettings() {
+  settingsOpen.value = !settingsOpen.value;
+  if (settingsOpen.value) void loadLeagues();
+}
+
 async function changeLanguage() {
   try {
     const v = await invoke<{ language: string; effective: string }>("set_language", {
@@ -135,6 +140,35 @@ const stats = ref<ParsedStat[]>([]);
 const baseProps = ref<BaseProp[]>([]);
 const leagues = ref<string[]>([]);
 const selectedLeague = ref("");
+// League choice from the settings panel: "auto" (current challenge league) or a name.
+const leagueSetting = ref("auto");
+
+async function loadLeagues() {
+  try {
+    const v = await invoke<{ league: string; effective: string; leagues: string[] }>("get_leagues");
+    leagueSetting.value = v.league;
+    leagues.value = v.leagues;
+    selectedLeague.value = v.effective;
+  } catch (e) {
+    console.error("get_leagues failed", e);
+  }
+}
+
+async function changeLeague() {
+  try {
+    const v = await invoke<{ league: string; effective: string; leagues: string[] }>("set_league", {
+      league: leagueSetting.value,
+    });
+    leagueSetting.value = v.league;
+    leagues.value = v.leagues;
+    selectedLeague.value = v.effective;
+  } catch (e) {
+    console.error("set_league failed", e);
+    return;
+  }
+  // Re-price the card on screen in the new league.
+  if (result.value && hasFilters.value && !busy.value && rateWait.value <= 0) void requery();
+}
 // Monotonic token: a fresh price-check bumps it so a slow in-flight requery for the
 // previous item can't overwrite the newly-checked one when it finally resolves. The
 // panel-open listeners and the sheet category switch guard on it too — any async fetch
@@ -312,7 +346,8 @@ async function requery() {
   const myGen = reqGen.value;
   try {
     const r = await invoke<PriceResult>("requery", {
-      league: selectedLeague.value,
+      // null = keep the settings choice (auto stays auto).
+      league: leagueSetting.value === "auto" ? null : selectedLeague.value,
       parsedStats: stats.value,
       baseProperties: baseProps.value,
     });
@@ -481,16 +516,17 @@ onUnmounted(() => {
 
 <template>
   <div class="overlay-root">
+    <!-- Outside the scrolling .card so ✕ / ⚙ stay put while the card scrolls. -->
+    <button class="close" :title="t(uiLang, 'hide')" @click="hide">✕</button>
+    <button
+      class="close gear"
+      :class="{ active: settingsOpen }"
+      :title="t(uiLang, 'settings')"
+      @click="toggleSettings"
+    >
+      ⚙
+    </button>
     <div class="card">
-      <button class="close" :title="t(uiLang, 'hide')" @click="hide">✕</button>
-      <button
-        class="close gear"
-        :class="{ active: settingsOpen }"
-        :title="t(uiLang, 'settings')"
-        @click="settingsOpen = !settingsOpen"
-      >
-        ⚙
-      </button>
 
       <template v-if="settingsOpen">
         <header class="head">
@@ -506,6 +542,15 @@ onUnmounted(() => {
           </div>
         </label>
         <div class="status">{{ t(uiLang, "langAutoHint") }}</div>
+        <label class="setting">
+          <span class="field-label">{{ t(uiLang, "league") }}</span>
+          <div class="select-wrap">
+            <select v-model="leagueSetting" class="league" :disabled="busy" @change="changeLeague">
+              <option value="auto">{{ t(uiLang, "leagueAuto") }}</option>
+              <option v-for="lg in leagues" :key="lg" :value="lg">{{ lg }}</option>
+            </select>
+          </div>
+        </label>
         <div class="actions">
           <button class="requery" @click="settingsOpen = false">{{ t(uiLang, "close") }}</button>
         </div>
@@ -635,14 +680,6 @@ onUnmounted(() => {
             <div>{{ nameParts[0] || t(uiLang, "unrecognized") }}</div>
             <div v-if="nameParts[1]" class="name-base">{{ nameParts[1] }}</div>
           </div>
-          <label v-if="leagues.length" class="league-field">
-            <span class="field-label">{{ t(uiLang, "league") }}</span>
-            <div class="select-wrap">
-              <select v-model="selectedLeague" class="league" :disabled="busy || rateWait > 0" @change="requery">
-                <option v-for="lg in leagues" :key="lg" :value="lg">{{ lg }}</option>
-              </select>
-            </div>
-          </label>
         </header>
 
         <section v-if="hasFilters" class="filters">
@@ -815,7 +852,7 @@ body,
 
 /* Settings toggle, left of ✕. */
 .close.gear {
-  right: 43px;
+  right: 49px;
   font-size: 15px;
 }
 .close.gear.active {
@@ -828,10 +865,14 @@ body,
   gap: 10px;
 }
 
+/* Pinned over the card's top-right corner (card inset 6px + 9/11px), above the
+   scrolling content. */
 .close {
   position: absolute;
-  top: 9px;
-  right: 11px;
+  z-index: 2;
+  pointer-events: auto;
+  top: 15px;
+  right: 17px;
   width: 26px;
   height: 26px;
   padding: 0;
@@ -883,7 +924,8 @@ body,
   flex-direction: column;
   gap: 8px;
   margin: -14px -16px 0;
-  padding: 12px 34px 0;
+  /* Side room for the pinned ✕ and ⚙ buttons. */
+  padding: 12px 72px 0;
   border-radius: 2px 2px 0 0;
   background: linear-gradient(180deg, #221a10, #14100a 88%);
 }
@@ -932,15 +974,6 @@ body,
   color: #aa9e82;
 }
 
-/* Labeled league control — a bare <select> read as plain text; the caption makes it
-   obviously a picker. */
-.league-field {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  align-self: center;
-  max-width: 100%;
-}
 
 .field-label {
   font: 400 11px/1.4 var(--smallcaps);

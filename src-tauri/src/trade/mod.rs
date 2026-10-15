@@ -718,6 +718,18 @@ impl Pricing {
         *self.league.lock().unwrap_or_else(|e| e.into_inner()) = league;
     }
 
+    /// The league override (`None` = auto).
+    pub fn league_setting(&self) -> Option<String> {
+        self.league.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The current leagues and the one prices resolve to (the override if it is still
+    /// a current league, else the challenge league) — for the settings panel.
+    pub async fn leagues(&self) -> (Vec<String>, String) {
+        let snapshot = self.ensure_caches().await;
+        (snapshot.leagues, snapshot.league)
+    }
+
     /// Current IP-rate-limit lockout in seconds, or `None` if clear. Poison-recovering
     /// so a stray panic can never brick pricing (ADR-0004 never-panics guarantee).
     fn check_lockout(&self) -> Option<u64> {
@@ -821,7 +833,7 @@ impl Pricing {
     /// trade2 query built from the *edited* stats/base. Honors the IP lockout.
     pub async fn requery(
         &self,
-        league: String,
+        league: Option<String>,
         parsed_stats: Vec<ParsedStat>,
         base_properties: Vec<BaseProp>,
     ) -> PriceResult {
@@ -831,11 +843,15 @@ impl Pricing {
 
     async fn requery_inner(
         &self,
-        league: String,
+        league: Option<String>,
         parsed_stats: Vec<ParsedStat>,
         base_properties: Vec<BaseProp>,
     ) -> PriceResult {
-        self.set_league(Some(league));
+        // `None` = keep the current choice (auto stays auto); the league is picked in
+        // the settings panel.
+        if let Some(l) = league {
+            self.set_league(Some(l));
+        }
         let snapshot = self.ensure_caches().await;
         let lg = snapshot.league.clone();
 
@@ -1270,7 +1286,7 @@ mod net_tests {
             s.active = false;
         }
         let r = tauri::async_runtime::block_on(p.requery(
-            first.league.clone(),
+            Some(first.league.clone()),
             stats,
             first.base_properties.clone(),
         ));
