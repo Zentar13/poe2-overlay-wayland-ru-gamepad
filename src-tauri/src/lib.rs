@@ -36,8 +36,9 @@ async fn requery(
     league: Option<String>,
     parsed_stats: Vec<trade::ParsedStat>,
     base_properties: Vec<trade::BaseProp>,
+    need: Option<usize>,
 ) -> Result<trade::PriceResult, ()> {
-    Ok(pricing.requery(league, parsed_stats, base_properties).await)
+    Ok(pricing.requery(league, parsed_stats, base_properties, need).await)
 }
 
 /// The regex cheat-sheet content for the overlay panel (T8, ADR-0006).

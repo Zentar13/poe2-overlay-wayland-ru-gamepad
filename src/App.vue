@@ -43,6 +43,7 @@ interface PriceResult {
   listings: Listing[];
   total: number | null;
   relaxed: string | null;
+  need: number | null;
   tradeUrl: string | null;
   parsedStats: ParsedStat[];
   baseProperties: BaseProp[];
@@ -218,6 +219,31 @@ const hasFilters = computed(() => stats.value.length > 0 || baseProps.value.leng
 // Gamepad selection over the filter rows (left stick moves it, X or A presses it): base
 // properties, then stat rows, then the "Search again" button. -1 = nothing selected.
 const padFocus = ref(-1);
+// "Match any K of the ticked stats" from a relaxed search (null = all of them); kept
+// for "Search again" so the card's query stays what was matched.
+const need = ref<number | null>(null);
+
+// Y on the pad: loosen the search one step — first drop socketed rune / enchant /
+// granted-skill mods (swappable, barely move the price), then any N−1, N−2 … of N mods.
+function relaxStep() {
+  if (!hasFilters.value || settingsOpen.value || busy.value || rateWait.value > 0) return;
+  const swappable = stats.value.filter((st) => st.active && /^(rune|enchant|skill)\./.test(st.id));
+  if (swappable.length) {
+    swappable.forEach((st) => (st.active = false));
+  } else {
+    const active = stats.value.filter((st) => st.active).length;
+    const next = (need.value ?? active) - 1;
+    if (next < 1) return; // already down to "any 1"
+    need.value = next;
+  }
+  void requery();
+}
+
+// RB on the pad: "Search again".
+function padRequery() {
+  if (!hasFilters.value || settingsOpen.value || busy.value || rateWait.value > 0) return;
+  void requery();
+}
 
 function padMove(dir: number) {
   if (!hasFilters.value || settingsOpen.value) return;
@@ -330,6 +356,7 @@ async function switchCategory(category: string) {
 
 function applyResult(r: PriceResult) {
   padFocus.value = -1;
+  need.value = r.need ?? null;
   danger.value = null; // a price result replaces any prior waystone danger panel
   cheatsheet.value = null;
   priceSheet.value = null;
@@ -362,6 +389,7 @@ async function requery() {
       league: leagueSetting.value === "auto" ? null : selectedLeague.value,
       parsedStats: stats.value,
       baseProperties: baseProps.value,
+      need: need.value,
     });
     if (myGen !== reqGen.value) return; // a newer price-check landed — drop the stale result
     applyResult(r);
@@ -431,6 +459,8 @@ onMounted(async () => {
   );
   unlisten.push(await listen<number>("gamepad-nav", (e) => padMove(e.payload)));
   unlisten.push(await listen("gamepad-select", () => padSelect()));
+  unlisten.push(await listen("gamepad-requery", () => padRequery()));
+  unlisten.push(await listen("gamepad-relax", () => relaxStep()));
   unlisten.push(
     await listen<string>("price-check-loading", (e) => {
       settingsOpen.value = false; // a new check takes the card back from settings
@@ -673,6 +703,7 @@ onUnmounted(() => {
           <div class="hint-row"><kbd>Ctrl+Alt+X</kbd><span>{{ t(uiLang, "hintHide") }}</span></div>
           <div class="hint-row"><kbd>R-stick / B</kbd><span>{{ t(uiLang, "hintPad") }}</span></div>
           <div class="hint-row"><kbd>L-stick / X·A</kbd><span>{{ t(uiLang, "hintPadFilters") }}</span></div>
+          <div class="hint-row"><kbd>RB / Y</kbd><span>{{ t(uiLang, "hintPadSearch") }}</span></div>
         </div>
       </template>
 

@@ -148,6 +148,10 @@ pub struct PriceResult {
     /// How the automatic search was loosened after the exact one came back empty
     /// (e.g. "any 3 of 4 mods"); `None` = the shown filters matched as-is.
     pub relaxed: Option<String>,
+    /// Match at least this many of the active stat filters (a trade2 `count` group)
+    /// instead of all of them — set by a relaxed search and carried into "Search
+    /// again" so the card's query stays what was matched. `None` = all.
+    pub need: Option<usize>,
     /// The search on the trade site (`…/trade2/search/poe2/<league>/<id>`), for the
     /// "Open on trade" button; `None` for poe.ninja / failed searches.
     pub trade_url: Option<String>,
@@ -187,6 +191,7 @@ impl PriceResult {
             listings: Vec::new(),
             total: None,
             relaxed: None,
+            need: None,
             trade_url: None,
             site_query: None,
             parsed_stats: Vec::new(),
@@ -242,6 +247,7 @@ fn bulk_result(
         listings: vec![listing],
         total: None,
         relaxed: None,
+        need: None,
         trade_url: None,
         site_query: None,
         parsed_stats: Vec::new(),
@@ -836,8 +842,16 @@ impl Pricing {
         league: Option<String>,
         parsed_stats: Vec<ParsedStat>,
         base_properties: Vec<BaseProp>,
+        need: Option<usize>,
     ) -> PriceResult {
-        let res = self.requery_inner(league, parsed_stats, base_properties).await;
+        // "any K of N" only means something below N active filters.
+        let active = parsed_stats.iter().filter(|s| s.active).count();
+        let need = need.filter(|k| *k >= 1 && *k < active);
+        let mut res = self.requery_inner(league, parsed_stats, base_properties, need).await;
+        if let Some(k) = need {
+            res.need = Some(k);
+            res.relaxed = Some(format!("any {k} of {active} mods"));
+        }
         self.finish(res).await
     }
 
@@ -846,6 +860,7 @@ impl Pricing {
         league: Option<String>,
         parsed_stats: Vec<ParsedStat>,
         base_properties: Vec<BaseProp>,
+        need: Option<usize>,
     ) -> PriceResult {
         // `None` = keep the current choice (auto stays auto); the league is picked in
         // the settings panel.
@@ -889,6 +904,7 @@ impl Pricing {
                 listings: Vec::new(),
                 total: None,
                 relaxed: None,
+                need: None,
                 trade_url: None,
                 site_query: None,
                 parsed_stats,
@@ -906,7 +922,7 @@ impl Pricing {
             base_properties,
             &snapshot,
             &self.rate,
-            None,
+            need,
         )
         .await
     }
@@ -1289,6 +1305,7 @@ mod net_tests {
             Some(first.league.clone()),
             stats,
             first.base_properties.clone(),
+            None,
         ));
         eprintln!("requery → status={:?} listings={}", r.status, r.listings.len());
         assert!(matches!(r.status, PriceStatus::Success | PriceStatus::Empty));

@@ -3,6 +3,7 @@
 //! the pad — the overlay's own Ctrl+Alt+D. It is read while the card is closed too, when
 //! the pad is NOT grabbed, so the game also sees that press: pick a button it ignores.
 //!
+//! RB runs "Search again", Y loosens the search one step;
 //! left stick moves a selection over the search filters and X or A presses it (toggles the
 //! filter / runs "Search again"), B closes.
 //!
@@ -171,6 +172,8 @@ impl State {
 
         let mut close = false;
         let mut select = false;
+        let mut requery = false;
+        let mut relax = false;
         let mut step = 0.0;
         let mut lost = false;
         if let Some(p) = self.input.as_mut() {
@@ -213,6 +216,14 @@ impl State {
                                     // its alias BTN_NORTH; A is BTN_SOUTH.
                                     if k == Key::BTN_NORTH || k == Key::BTN_SOUTH {
                                         select = true;
+                                    }
+                                    // RB = search again; Y (BTN_Y 0x134, the crate's BTN_WEST)
+                                    // = loosen the search one step.
+                                    if k == Key::BTN_TR {
+                                        requery = true;
+                                    }
+                                    if k == Key::BTN_WEST {
+                                        relax = true;
                                     }
                                 } else if ev.value() == 0 {
                                     self.held.remove(&k.code());
@@ -271,6 +282,12 @@ impl State {
             }
             if select {
                 let _ = win.emit("gamepad-select", ());
+            }
+            if requery {
+                let _ = win.emit("gamepad-requery", ());
+            }
+            if relax {
+                let _ = win.emit("gamepad-relax", ());
             }
         } else {
             self.nav_dir = 0;

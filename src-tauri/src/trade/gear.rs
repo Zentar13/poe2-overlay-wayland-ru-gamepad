@@ -164,6 +164,7 @@ async fn relax_search(
             PriceStatus::Success => {
                 eprintln!("[gear] relaxed search hit: {label}");
                 res.relaxed = Some(label);
+                res.need = need;
                 return Some(res);
             }
             PriceStatus::Empty => continue,
@@ -753,6 +754,7 @@ fn result(
         leagues: snapshot.leagues.clone(),
         total: None,
         relaxed: None,
+        need: None,
         trade_url: None,
         site_query: None,
     }
