@@ -1,6 +1,6 @@
 [package]
 name = "poe2-overlay"
-version = "0.2.0"
+version = "0.2.1"
 description = "Wayland-native Path of Exile 2 trade overlay for KDE Plasma"
 authors = ["André Lund <olund.dev@pm.me>"]
 edition = "2021"
