@@ -66,8 +66,8 @@ fn copy_to_clipboard(clip: State<'_, clipboard::Clip>, text: String) -> Result<(
 
 /// Current settings for the settings panel.
 #[tauri::command]
-fn get_settings(pricing: State<'_, trade::Pricing>) -> settings::SettingsView {
-    settings_view(&pricing)
+fn get_settings(app: tauri::AppHandle, pricing: State<'_, trade::Pricing>) -> settings::SettingsView {
+    settings_view(&app, &pricing)
 }
 
 /// Set the UI language (`"auto"` or a code), persist it, and tell the panel which
@@ -86,7 +86,7 @@ fn set_language(
         eprintln!("[settings] save failed: {e}");
     }
     let _ = app.emit("ui-lang", pricing.ui_lang().code());
-    settings_view(&pricing)
+    settings_view(&app, &pricing)
 }
 
 /// Leagues for the settings panel.
@@ -120,10 +120,46 @@ async fn league_view(pricing: &trade::Pricing) -> settings::LeagueView {
     }
 }
 
-fn settings_view(pricing: &trade::Pricing) -> settings::SettingsView {
+/// Choose the gamepad button that runs a price check (`"none"` to turn it off).
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn set_pad_trigger(
+    app: tauri::AppHandle,
+    pricing: State<'_, trade::Pricing>,
+    button: String,
+) -> settings::SettingsView {
+    let mut saved = settings::load(&app);
+    saved.pad_trigger = Some(button);
+    gamepad::set_trigger(saved.pad_trigger.as_deref());
+    if let Err(e) = settings::save(&app, &saved) {
+        eprintln!("[settings] save failed: {e}");
+    }
+    settings::SettingsView {
+        pad_trigger: saved.pad_trigger.clone().unwrap_or_else(|| "none".into()),
+        ..settings_view_base(&pricing)
+    }
+}
+
+/// Non-Linux stub (no gamepad support there yet).
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+fn set_pad_trigger(pricing: State<'_, trade::Pricing>, button: String) -> settings::SettingsView {
+    let _ = button;
+    settings_view_base(&pricing)
+}
+
+fn settings_view(app: &tauri::AppHandle, pricing: &trade::Pricing) -> settings::SettingsView {
+    settings::SettingsView {
+        pad_trigger: settings::load(app).pad_trigger.unwrap_or_else(|| "none".into()),
+        ..settings_view_base(pricing)
+    }
+}
+
+fn settings_view_base(pricing: &trade::Pricing) -> settings::SettingsView {
     settings::SettingsView {
         language: pricing.ui_setting().map_or("auto", |l| l.code()).to_string(),
         effective: pricing.ui_lang().code().to_string(),
+        pad_trigger: "none".into(),
     }
 }
 
@@ -173,7 +209,8 @@ pub fn run() {
             get_settings,
             set_language,
             get_leagues,
-            set_league
+            set_league,
+            set_pad_trigger
         ])
         .setup(|app| {
             let window = app
@@ -195,6 +232,8 @@ pub fn run() {
             let saved = settings::load(app.handle());
             pricing.set_ui_setting(saved.lang());
             pricing.set_league(saved.league());
+            #[cfg(target_os = "linux")]
+            gamepad::set_trigger(saved.pad_trigger.as_deref());
             app.manage(pricing);
             // Controller players: right stick scrolls / B closes the visible card.
             #[cfg(target_os = "linux")]

@@ -97,12 +97,24 @@ interface PriceSheet {
 const uiLang = ref<string>("en");
 const settingsOpen = ref(false);
 const langSetting = ref<string>("auto");
+// Gamepad button that runs a price check ("none" = off); see gamepad.rs.
+const padTrigger = ref<string>("none");
+
+async function changePadTrigger() {
+  try {
+    const v = await invoke<{ padTrigger: string }>("set_pad_trigger", { button: padTrigger.value });
+    padTrigger.value = v.padTrigger;
+  } catch (e) {
+    console.error("set_pad_trigger failed", e);
+  }
+}
 
 async function loadSettings() {
   try {
-    const v = await invoke<{ language: string; effective: string }>("get_settings");
+    const v = await invoke<{ language: string; effective: string; padTrigger: string }>("get_settings");
     langSetting.value = v.language;
     uiLang.value = v.effective;
+    padTrigger.value = v.padTrigger;
   } catch (e) {
     console.error("get_settings failed", e);
   }
@@ -551,6 +563,19 @@ onUnmounted(() => {
             </select>
           </div>
         </label>
+        <label class="setting">
+          <span class="field-label">{{ t(uiLang, "padTrigger") }}</span>
+          <div class="select-wrap">
+            <select v-model="padTrigger" class="league" @change="changePadTrigger">
+              <option value="none">{{ t(uiLang, "padNone") }}</option>
+              <option value="share">Share</option>
+              <option value="select">View / Back</option>
+              <option value="l3">L3</option>
+              <option value="r3">R3</option>
+            </select>
+          </div>
+        </label>
+        <div class="status">{{ t(uiLang, "padTriggerHint") }}</div>
         <div class="actions">
           <button class="requery" @click="settingsOpen = false">{{ t(uiLang, "close") }}</button>
         </div>

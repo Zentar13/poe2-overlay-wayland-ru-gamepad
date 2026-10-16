@@ -16,6 +16,10 @@ pub struct Settings {
     /// Trade league to price in; `None`/`"auto"` = the current challenge league.
     #[serde(default)]
     pub league: Option<String>,
+    /// Gamepad button that runs a price check: `"share"`, `"select"`, `"l3"`, `"r3"`;
+    /// `None`/`"none"` = off.
+    #[serde(default)]
+    pub pad_trigger: Option<String>,
 }
 
 impl Settings {
@@ -43,11 +47,14 @@ pub struct LeagueView {
 
 /// What the settings panel shows: the choice and the language actually in effect.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     /// `"auto"` or a language code.
     pub language: String,
     /// The UI language in effect (auto resolves to the game client's).
     pub effective: String,
+    /// Gamepad price-check button id, `"none"` when off.
+    pub pad_trigger: String,
 }
 
 fn path(app: &AppHandle) -> Option<PathBuf> {

@@ -1,4 +1,8 @@
 //! Gamepad control of the overlay card: right stick scrolls, D-pad up/down pages,
+//! An optional trigger button (settings: Share / View / L3 / R3) runs a price check from
+//! the pad — the overlay's own Ctrl+Alt+D. It is read while the card is closed too, when
+//! the pad is NOT grabbed, so the game also sees that press: pick a button it ignores.
+//!
 //! left stick moves a selection over the search filters and X or A presses it (toggles the
 //! filter / runs "Search again"), B closes.
 //!
@@ -24,6 +28,7 @@
 //! that disappear are rescanned every couple of seconds.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::os::fd::AsRawFd;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,6 +52,26 @@ const NAV_THRESHOLD: f64 = 0.5;
 const NAV_DELAY: Duration = Duration::from_millis(400);
 const NAV_REPEAT: Duration = Duration::from_millis(120);
 
+/// Key code of the price-check trigger button, 0 = none (set from the settings).
+static TRIGGER: AtomicU16 = AtomicU16::new(0);
+
+/// Trigger choices offered in the settings, by id.
+const TRIGGERS: &[(&str, Key)] = &[
+    ("share", Key::KEY_RECORD),
+    ("select", Key::BTN_SELECT),
+    ("l3", Key::BTN_THUMBL),
+    ("r3", Key::BTN_THUMBR),
+];
+
+/// Set the price-check trigger by settings id (`"share"`, `"select"`, `"l3"`, `"r3"`);
+/// anything else (`"none"`, `None`) disables it.
+pub fn set_trigger(id: Option<&str>) {
+    let code = id
+        .and_then(|id| TRIGGERS.iter().find(|(t, _)| *t == id))
+        .map_or(0, |(_, k)| k.code());
+    TRIGGER.store(code, Ordering::Relaxed);
+}
+
 /// Start the gamepad thread.
 pub fn spawn(app: AppHandle) {
     thread::spawn(move || run(app));
@@ -63,7 +88,11 @@ fn run(app: AppHandle) {
             st.rescan();
         }
         if let Some(win) = app.get_webview_window("main") {
-            st.tick(&win);
+            if st.tick(&win) {
+                // Off this thread: price_check sleeps while the game copies the item.
+                let app = app.clone();
+                thread::spawn(move || crate::hotkey::price_check(&app));
+            }
         }
         thread::sleep(TICK);
     }
@@ -124,9 +153,13 @@ impl State {
         }
     }
 
-    fn tick(&mut self, win: &WebviewWindow) {
+    /// One poll; returns `true` when the price-check trigger button was pressed.
+    fn tick(&mut self, win: &WebviewWindow) -> bool {
         let visible = win.is_visible().unwrap_or(false);
-        let share_closes = self.steam.is_none();
+        let trigger = TRIGGER.load(Ordering::Relaxed);
+        let mut triggered = false;
+        // Share closes the card only when the pad is grabbed and Share isn't the trigger.
+        let share_closes = self.steam.is_none() && trigger != Key::KEY_RECORD.code();
 
         // Drain the blocker's queue too, so nothing queued while grabbed replays later.
         if let Some(s) = self.steam.as_mut() {
@@ -155,6 +188,19 @@ impl State {
                             }
                             InputEventKind::AbsAxis(AbsoluteAxisType::ABS_HAT0Y) if self.grabbed => {
                                 step += ev.value() as f64 * DPAD_PX;
+                            }
+                            InputEventKind::Key(k) if trigger != 0 && k.code() == trigger => {
+                                if ev.value() == 1 {
+                                    triggered = true;
+                                }
+                                // Track it like any key so the grab isn't released mid-press.
+                                if self.grabbed {
+                                    if ev.value() == 1 {
+                                        self.held.insert(k.code());
+                                    } else if ev.value() == 0 {
+                                        self.held.remove(&k.code());
+                                    }
+                                }
                             }
                             InputEventKind::Key(k) if self.grabbed => {
                                 if ev.value() == 1 {
@@ -191,7 +237,7 @@ impl State {
 
         if close && visible {
             let _ = win.hide();
-            return;
+            return triggered;
         }
 
         if visible && !self.grabbed {
@@ -229,6 +275,7 @@ impl State {
         } else {
             self.nav_dir = 0;
         }
+        triggered
     }
 
     /// Left stick → one selection step per push, auto-repeating while held.
